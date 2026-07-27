@@ -1,0 +1,44 @@
+services:
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-whatsapp_orders}
+      MARIADB_USER: ${MARIADB_USER:-orders_app}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-orders_dev_password}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-root_dev_password}
+      TZ: ${TZ:-Europe/Madrid}
+    ports:
+      - "127.0.0.1:3308:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.31.5
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-replace-this-local-key-before-production}
+      GENERIC_TIMEZONE: ${TZ:-Europe/Madrid}
+      TZ: ${TZ:-Europe/Madrid}
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/workspace/n8n:ro
+
+volumes:
+  mariadb_data:
+  n8n_data:

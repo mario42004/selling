@@ -1,0 +1,74 @@
+{
+  "id": "local-daily-summary",
+  "name": "03 - Resumen diario local",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "webhook-summary",
+      "name": "Solicitar resumen",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-360, 0],
+      "webhookId": "7c24b0d6-9e27-4d67-8b43-1d471d8d4c03",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "orders/daily-summary",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "query-summary",
+      "name": "Consultar confirmados",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [-120, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('order_id', order_id, 'customer_name', customer_name, 'phone', phone, 'address', delivery_address, 'total', total, 'items', items)), JSON_ARRAY()) AS orders_json FROM daily_confirmed_orders WHERE DATE(payment_confirmed_at) = CURDATE();",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "format-summary",
+      "name": "Formatear WhatsApp",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 0],
+      "parameters": {
+        "jsCode": "let orders = $json.orders_json;\nif (typeof orders === 'string') orders = JSON.parse(orders);\norders = Array.isArray(orders) ? orders : [];\nconst date = new Intl.DateTimeFormat('es-ES', { timeZone: 'Europe/Madrid' }).format(new Date());\nconst sections = orders.map((order) => `#${order.order_id} — ${order.customer_name}\\n${order.address}\\nTel: ${order.phone}\\n${order.items}\\nTotal: ${order.total} €`);\nconst message = sections.length\n  ? `PEDIDOS CONFIRMADOS — ${date}\\n\\n${sections.join('\\n\\n')}`\n  : `PEDIDOS CONFIRMADOS — ${date}\\n\\nNo hay pedidos confirmados.`;\nreturn [{ json: { ok: true, count: orders.length, message, orders } }];"
+      }
+    },
+    {
+      "id": "respond-summary",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [360, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Solicitar resumen": { "main": [[{ "node": "Consultar confirmados", "type": "main", "index": 0 }]] },
+    "Consultar confirmados": { "main": [[{ "node": "Formatear WhatsApp", "type": "main", "index": 0 }]] },
+    "Formatear WhatsApp": { "main": [[{ "node": "Responder", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

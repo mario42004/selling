@@ -1,0 +1,117 @@
+{
+  "id": "local-order-intake",
+  "name": "01 - Pedido local (texto libre)",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "webhook-intake",
+      "name": "Recibir pedido local",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-720, 0],
+      "webhookId": "7c24b0d6-9e27-4d67-8b43-1d471d8d4c01",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "orders/intake",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "normalize-request",
+      "name": "Normalizar solicitud",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-500, 0],
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst required = ['customer_name', 'phone', 'address', 'message'];\nconst missing = required.filter((key) => !String(body[key] ?? '').trim());\nif (missing.length) {\n  throw new Error(`Faltan campos: ${missing.join(', ')}`);\n}\nreturn [{ json: {\n  external_message_id: String(body.external_message_id ?? `local-${Date.now()}`),\n  customer_name: String(body.customer_name).trim(),\n  phone: String(body.phone).trim(),\n  address: String(body.address).trim(),\n  raw_message: String(body.message).trim()\n} }];"
+      }
+    },
+    {
+      "id": "list-products",
+      "name": "Leer catálogo activo",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [-260, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT sku, name, aliases, price, stock, image_url FROM products WHERE active = TRUE ORDER BY CHAR_LENGTH(name) DESC;",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "parse-order",
+      "name": "Interpretar texto (fallback local)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-20, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const request = $('Normalizar solicitud').first().json;\nconst products = $input.all().map((item) => item.json);\nconst normalize = (value) => String(value ?? '')\n  .normalize('NFD')\n  .replace(/[\\u0300-\\u036f]/g, '')\n  .toLowerCase();\nconst message = normalize(request.raw_message);\nconst numberWords = { un: 1, una: 1, uno: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9, diez: 10 };\nconst items = [];\nfor (const product of products) {\n  let aliases = product.aliases;\n  if (typeof aliases === 'string') {\n    try { aliases = JSON.parse(aliases); } catch { aliases = []; }\n  }\n  aliases = [...(Array.isArray(aliases) ? aliases : []), product.name]\n    .map(normalize)\n    .sort((a, b) => b.length - a.length);\n  const matches = aliases\n    .map((alias) => ({ alias, index: message.indexOf(alias) }))\n    .filter((match) => match.index >= 0)\n    .sort((a, b) => a.index - b.index || b.alias.length - a.alias.length);\n  if (!matches.length) continue;\n  const match = matches[0];\n  const prefix = message.slice(Math.max(0, match.index - 30), match.index);\n  const quantityMatch = prefix.match(/(?:^|\\s)(\\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)(?:\\s*(?:x|de))?\\s*$/);\n  const rawQuantity = quantityMatch?.[1];\n  const quantity = rawQuantity ? (Number(rawQuantity) || numberWords[rawQuantity] || 1) : 1;\n  items.push({ sku: product.sku, quantity, matched_alias: match.alias });\n}\nconst payload = { ...request, items };\nreturn [{ json: {\n  payload,\n  payload_b64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),\n  parser: 'local-catalog-fallback',\n  recognized_items: items.length\n} }];"
+      }
+    },
+    {
+      "id": "create-draft",
+      "name": "Crear borrador",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CALL create_draft_order(CONVERT(FROM_BASE64('{{ $json.payload_b64 }}') USING utf8mb4));",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "format-result",
+      "name": "Preparar respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().flatMap((item) => Array.isArray(item.json) ? item.json : [item.json]);\nconst row = rows.find((item) => item?.result !== undefined);\nif (!row) return [{ json: { ok: false, error: 'MariaDB no devolvió un resultado' } }];\nconst result = typeof row.result === 'string' ? JSON.parse(row.result) : row.result;\nreturn [{ json: result }];"
+      }
+    },
+    {
+      "id": "respond-intake",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [700, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Recibir pedido local": { "main": [[{ "node": "Normalizar solicitud", "type": "main", "index": 0 }]] },
+    "Normalizar solicitud": { "main": [[{ "node": "Leer catálogo activo", "type": "main", "index": 0 }]] },
+    "Leer catálogo activo": { "main": [[{ "node": "Interpretar texto (fallback local)", "type": "main", "index": 0 }]] },
+    "Interpretar texto (fallback local)": { "main": [[{ "node": "Crear borrador", "type": "main", "index": 0 }]] },
+    "Crear borrador": { "main": [[{ "node": "Preparar respuesta", "type": "main", "index": 0 }]] },
+    "Preparar respuesta": { "main": [[{ "node": "Responder", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
