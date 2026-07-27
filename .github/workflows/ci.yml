@@ -92,10 +92,17 @@ jobs:
 
       - name: Exercise operator approval flow
         run: |
-          response=$(curl --fail --silent --show-error \
-            -X POST http://127.0.0.1:5678/webhook/orders/intake \
-            -H 'Content-Type: application/json' \
-            --data "{\"external_message_id\":\"ci-${GITHUB_RUN_ID}\",\"customer_name\":\"Cliente CI\",\"phone\":\"+34000000000\",\"address\":\"Dirección CI\",\"message\":\"una agua grande\"}")
+          response=''
+          for attempt in $(seq 1 30); do
+            if response=$(curl --fail --silent --show-error \
+              -X POST http://127.0.0.1:5678/webhook/orders/intake \
+              -H 'Content-Type: application/json' \
+              --data "{\"external_message_id\":\"ci-${GITHUB_RUN_ID}\",\"customer_name\":\"Cliente CI\",\"phone\":\"+34000000000\",\"address\":\"Dirección CI\",\"message\":\"una agua grande\"}"); then
+              break
+            fi
+            sleep 2
+          done
+          test -n "$response"
           order_id=$(printf '%s' "$response" | jq -er '.order_id')
 
           curl --fail --silent --show-error \
