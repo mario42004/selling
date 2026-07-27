@@ -217,3 +217,43 @@ Datos persistentes:
 
 Conserva siempre el mismo `N8N_ENCRYPTION_KEY`. Si lo pierdes, n8n no podrá
 descifrar las credenciales guardadas.
+
+## GitHub Actions
+
+El repositorio incluye dos automatizaciones:
+
+- `CI`: valida Docker Compose, los JSON de n8n y los scripts; después levanta
+  n8n y MariaDB, importa los workflows y comprueba el catálogo.
+- `Deploy production`: despliega manualmente la rama `main` en la máquina
+  remota mediante SSH.
+
+Antes del primer despliegue, crea en GitHub un entorno llamado `production`.
+Es recomendable configurarlo con aprobación manual. Añade estos secretos al
+entorno:
+
+- `DEPLOY_HOST`: IP o nombre DNS del servidor.
+- `DEPLOY_USER`: usuario SSH con permisos para Docker y para el proyecto.
+- `DEPLOY_PATH`: ruta absoluta del repositorio en el servidor.
+- `DEPLOY_SSH_KEY`: clave SSH privada dedicada al despliegue.
+- `DEPLOY_KNOWN_HOSTS`: línea de `known_hosts` correspondiente al servidor.
+
+Opcionalmente, crea la variable de entorno `DEPLOY_PORT`; si no existe se usa
+el puerto `22`. Para obtener `DEPLOY_KNOWN_HOSTS` desde una conexión de
+confianza puedes ejecutar localmente:
+
+```bash
+ssh-keyscan -H servidor.example.com
+```
+
+Antes de ejecutar el workflow, la máquina remota debe tener:
+
+1. Este repositorio clonado en `DEPLOY_PATH`, con acceso de lectura a GitHub.
+2. Docker Compose y Git instalados.
+3. El archivo `.env.production` configurado y protegido con permisos `600`.
+4. Nginx, DNS y el certificado TLS preparados según la sección anterior.
+
+El despliegue se inicia en GitHub desde **Actions → Deploy production → Run
+workflow**. El workflow actualiza `main` con avance rápido, descarga las
+imágenes, inicia los contenedores y publica los workflows de n8n. Las
+contraseñas de la aplicación nunca se copian desde GitHub: permanecen en
+`.env.production` dentro del servidor.

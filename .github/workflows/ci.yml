@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Validate Docker Compose files
+        run: |
+          docker compose --env-file .env.example -f compose.yaml config -q
+          docker compose --env-file .env.production.example -f compose.prod.yaml config -q
+
+      - name: Validate n8n JSON files
+        run: |
+          jq empty n8n/credentials/local-mariadb.json
+          jq empty n8n/workflows/*.json
+
+      - name: Validate scripts
+        run: |
+          sh -n scripts/bootstrap-production.sh
+          node --check scripts/render-n8n-mariadb-credential.mjs
+
+  smoke-test:
+    name: Start Docker stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Start services
+        run: docker compose --env-file .env.example -f compose.yaml up -d
+
+      - name: Wait for n8n
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:5678/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose --env-file .env.example -f compose.yaml logs
+          exit 1
+
+      - name: Import and publish workflows
+        run: |
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n import:credentials --input=/workspace/n8n/credentials/local-mariadb.json
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n import:workflow --separate --input=/workspace/n8n/workflows
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n publish:workflow --id=local-order-intake
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n publish:workflow --id=local-payment-approval
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n publish:workflow --id=local-daily-summary
+
+      - name: Verify MariaDB catalog
+        run: |
+          docker compose --env-file .env.example -f compose.yaml exec -T mariadb \
+            mariadb -uorders_app -porders_dev_password whatsapp_orders \
+            -e "SELECT COUNT(*) AS products FROM products;"
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose --env-file .env.example -f compose.yaml logs
+
+      - name: Stop services
+        if: always()
+        run: docker compose --env-file .env.example -f compose.yaml down -v
