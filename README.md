@@ -114,6 +114,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
+- `n8n/workflows/04-whatsapp-order-intake.json`: recepción desde WhatsApp y creación del borrador.
 
 ## Comandos útiles
 
@@ -208,10 +209,28 @@ método Certbot que ya utilice el servidor antes de activar el bloque HTTPS.
 Después abre `https://DOMINIO_CONFIGURADO` para n8n y
 `https://DOMINIO_CONFIGURADO/operator/` para gestionar los pedidos. Nginx
 solicitará el usuario de `.htpasswd-n8n` en ambos casos. Solo
-`/webhook/orders/intake` permanece público; los endpoints de aprobación,
-resumen y cualquier otro webhook quedan bloqueados desde Internet.
+`/webhook/orders/intake` y la ruta exacta verificada del trigger de WhatsApp
+permanecen públicas; los endpoints de aprobación, resumen y cualquier otro
+webhook quedan bloqueados desde Internet.
 La contraseña de MariaDB se lee desde `.env.production`, se importa cifrada en
 la base interna de n8n y no se escribe dentro de los workflows.
+
+### Actualizar el workflow de WhatsApp
+
+El workflow de WhatsApp conserva el ID, webhook y referencia a la credencial
+configurados en la instancia de producción. Se actualiza por separado para que
+las instalaciones locales sin credenciales de Meta puedan ejecutar las pruebas:
+
+```bash
+sh scripts/update-whatsapp-workflow.sh
+```
+
+El mensaje entrante debe ser de texto. El flujo toma el nombre y teléfono desde
+WhatsApp, utiliza el ID del mensaje para evitar duplicados y reconoce productos
+del catálogo local. También admite una dirección escrita como
+`Dirección: Calle Ejemplo 3` o `entrega en Calle Ejemplo 3`. Si no encuentra
+una dirección, crea el borrador con `Pendiente de confirmar` para que el
+operador no confunda el dato con una dirección definitiva.
 
 Para revisar los logs:
 

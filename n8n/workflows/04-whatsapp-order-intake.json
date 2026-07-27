@@ -1,0 +1,162 @@
+{
+  "id": "EOdbOslXlvVg04pf",
+  "name": "04 - Pedido por WhatsApp",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "36dfa5ef-a613-411e-9f48-cfaea15ae1c1",
+      "name": "WhatsApp Trigger",
+      "type": "n8n-nodes-base.whatsAppTrigger",
+      "typeVersion": 1,
+      "position": [-720, 0],
+      "webhookId": "18095208-0377-4016-bf0d-887cf733e2e6",
+      "parameters": {
+        "updates": [
+          "messages"
+        ],
+        "options": {
+          "messageStatusUpdates": []
+        }
+      },
+      "credentials": {
+        "whatsAppTriggerApi": {
+          "id": "dXaoJ53vMtRZhBaF",
+          "name": "WhatsApp OAuth account"
+        }
+      }
+    },
+    {
+      "id": "normalize-whatsapp-message",
+      "name": "Normalizar mensaje de WhatsApp",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-500, 0],
+      "parameters": {
+        "jsCode": "const message = Array.isArray($json.messages) ? $json.messages[0] : null;\nif (!message || message.type !== 'text' || !message.text?.body) return [];\n\nconst text = String(message.text.body).trim();\nconst contact = Array.isArray($json.contacts) ? $json.contacts[0] : null;\nconst rawPhone = String(message.from ?? contact?.wa_id ?? '').replace(/[^0-9]/g, '');\nif (!rawPhone) throw new Error('El mensaje no contiene un teléfono de origen');\n\nconst addressPattern = /(?:direcci[oó]n|domicilio|entregar? en|entrega en)\\s*[:,-]?\\s*(.+)$/i;\nconst addressMatch = text.match(addressPattern);\nconst address = String(addressMatch?.[1] ?? 'Pendiente de confirmar').trim();\n\nreturn [{ json: {\n  source: 'whatsapp',\n  external_message_id: String(message.id),\n  customer_name: String(contact?.profile?.name ?? 'Cliente WhatsApp').trim(),\n  phone: `+${rawPhone}`,\n  address,\n  address_pending: !addressMatch,\n  raw_message: text\n} }];"
+      }
+    },
+    {
+      "id": "list-products-whatsapp",
+      "name": "Leer catálogo activo",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [-260, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT sku, name, aliases, price, stock, image_url FROM products WHERE active = TRUE ORDER BY CHAR_LENGTH(name) DESC;",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "parse-whatsapp-order",
+      "name": "Interpretar pedido",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-20, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const request = $('Normalizar mensaje de WhatsApp').first().json;\nconst products = $input.all().map((item) => item.json);\nconst normalize = (value) => String(value ?? '')\n  .normalize('NFD')\n  .replace(/[\\u0300-\\u036f]/g, '')\n  .toLowerCase();\nconst message = normalize(request.raw_message);\nconst numberWords = { un: 1, una: 1, uno: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9, diez: 10 };\nconst items = [];\nfor (const product of products) {\n  let aliases = product.aliases;\n  if (typeof aliases === 'string') {\n    try { aliases = JSON.parse(aliases); } catch { aliases = []; }\n  }\n  aliases = [...(Array.isArray(aliases) ? aliases : []), product.name]\n    .map(normalize)\n    .sort((a, b) => b.length - a.length);\n  const matches = aliases\n    .map((alias) => ({ alias, index: message.indexOf(alias) }))\n    .filter((match) => match.index >= 0)\n    .sort((a, b) => a.index - b.index || b.alias.length - a.alias.length);\n  if (!matches.length) continue;\n  const match = matches[0];\n  const prefix = message.slice(Math.max(0, match.index - 30), match.index);\n  const quantityMatch = prefix.match(/(?:^|\\s)(\\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)(?:\\s*(?:x|de))?\\s*$/);\n  const rawQuantity = quantityMatch?.[1];\n  const quantity = rawQuantity ? (Number(rawQuantity) || numberWords[rawQuantity] || 1) : 1;\n  items.push({ sku: product.sku, quantity, matched_alias: match.alias });\n}\nconst payload = { ...request, items };\nreturn [{ json: {\n  payload,\n  payload_b64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),\n  parser: 'local-catalog-fallback',\n  recognized_items: items.length\n} }];"
+      }
+    },
+    {
+      "id": "create-whatsapp-draft",
+      "name": "Crear borrador",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CALL create_draft_order(CONVERT(FROM_BASE64('{{ $json.payload_b64 }}') USING utf8mb4));",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "format-whatsapp-result",
+      "name": "Preparar resultado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().flatMap((item) => Array.isArray(item.json) ? item.json : [item.json]);\nconst row = rows.find((item) => item?.result !== undefined);\nif (!row) throw new Error('MariaDB no devolvió un resultado');\nconst result = typeof row.result === 'string' ? JSON.parse(row.result) : row.result;\nif (!result.ok) throw new Error(result.error ?? 'No fue posible crear el pedido');\nconst request = $('Normalizar mensaje de WhatsApp').first().json;\nreturn [{ json: {\n  ...result,\n  source: 'whatsapp',\n  address_pending: request.address_pending,\n  customer_message: request.address_pending\n    ? `Recibimos tu pedido #${result.order_id}. Falta confirmar la dirección de entrega.`\n    : `Recibimos tu pedido #${result.order_id} por ${result.total} €. El pago será verificado manualmente.`\n} }];"
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalizar mensaje de WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar mensaje de WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Leer catálogo activo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer catálogo activo": {
+      "main": [
+        [
+          {
+            "node": "Interpretar pedido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpretar pedido": {
+      "main": [
+        [
+          {
+            "node": "Crear borrador",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crear borrador": {
+      "main": [
+        [
+          {
+            "node": "Preparar resultado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

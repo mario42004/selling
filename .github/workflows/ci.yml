@@ -36,7 +36,9 @@ jobs:
       - name: Validate scripts
         run: |
           sh -n scripts/bootstrap-production.sh
+          sh -n scripts/update-whatsapp-workflow.sh
           node --check scripts/render-n8n-mariadb-credential.mjs
+          node scripts/test-whatsapp-workflow.mjs
 
       - name: Validate operator PHP
         run: |
@@ -73,7 +75,11 @@ jobs:
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \
             n8n import:credentials --input=/workspace/n8n/credentials/local-mariadb.json
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \
-            n8n import:workflow --separate --input=/workspace/n8n/workflows
+            n8n import:workflow --input=/workspace/n8n/workflows/01-local-order-intake.json
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n import:workflow --input=/workspace/n8n/workflows/02-local-payment-approval.json
+          docker compose --env-file .env.example -f compose.yaml exec -T n8n \
+            n8n import:workflow --input=/workspace/n8n/workflows/03-local-daily-summary.json
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \
             n8n publish:workflow --id=local-order-intake
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \
