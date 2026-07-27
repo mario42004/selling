@@ -17,7 +17,7 @@ modelo de datos.
 ## Requisitos
 
 - Docker y Docker Compose.
-- Puertos locales `5678` y `3308` disponibles.
+- Puertos locales `5678`, `5680` y `3308` disponibles.
 - `curl` para las pruebas de ejemplo.
 
 ## Arranque
@@ -33,6 +33,7 @@ solicite. Los tres flujos se importan y publican desde la línea de comandos.
 Servicios:
 
 - n8n: <http://localhost:5678>
+- Panel de pedidos: <http://localhost:5680>
 - MariaDB desde el host: `127.0.0.1:3308`
 - MariaDB dentro de Docker: `mariadb:3306`
 
@@ -59,9 +60,15 @@ curl -sS -X POST http://127.0.0.1:5678/webhook/orders/intake \
 La respuesta contiene el `order_id`. El identificador externo evita duplicar
 un pedido si WhatsApp reintenta el mismo webhook.
 
-### 2. Aprobar manualmente el pago
+### 2. Revisar y aprobar manualmente el pago
 
-Sustituye `3` por el identificador recibido:
+Abre <http://localhost:5680>. El panel permite filtrar pedidos, confirmar o
+rechazar el pago y marcar los pedidos confirmados como despachados. La
+confirmación vuelve a comprobar las existencias y descuenta el inventario de
+forma transaccional.
+
+Para pruebas técnicas también se conserva el webhook local. Sustituye `3` por
+el identificador recibido:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:5678/webhook/orders/approve \
@@ -69,8 +76,7 @@ curl -sS -X POST http://127.0.0.1:5678/webhook/orders/approve \
   --data '{"order_id": 3, "approved_by": "Operador"}'
 ```
 
-La operación vuelve a comprobar las existencias, descuenta el inventario y es
-idempotente: aprobar dos veces no descuenta dos veces.
+La aprobación es idempotente: aprobar dos veces no descuenta dos veces.
 
 ### 3. Obtener el resumen del día
 
@@ -102,7 +108,8 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 
 ## Archivos principales
 
-- `compose.yaml`: n8n y MariaDB.
+- `compose.yaml`: n8n, MariaDB y panel de operador.
+- `operator/`: interfaz protegida para gestionar pedidos.
 - `db/init/001_schema.sql`: tablas, catálogo, procedimientos y vista diaria.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
@@ -135,8 +142,9 @@ si quieres conservar esos datos.
 ## Despliegue remoto con Docker
 
 La configuración de producción reutiliza el Nginx instalado en el servidor.
-n8n se publica únicamente en `127.0.0.1:5678`, por lo que no queda accesible
-directamente desde Internet. MariaDB permanece exclusivamente en la red Docker.
+n8n se publica únicamente en `127.0.0.1:5678` y el panel en
+`127.0.0.1:5680`; ninguno queda accesible directamente desde Internet.
+MariaDB permanece exclusivamente en la red Docker.
 
 Antes de iniciar:
 
@@ -164,7 +172,7 @@ chmod 600 .env.production
 Inicia los contenedores:
 
 ```bash
-docker compose --env-file .env.production -f compose.prod.yaml up -d
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
@@ -197,10 +205,11 @@ La plantilla presupone que el certificado ya existe en
 `/etc/letsencrypt/live/DOMINIO/`. Si todavía no existe, hay que emitirlo con el
 método Certbot que ya utilice el servidor antes de activar el bloque HTTPS.
 
-Después abre `https://DOMINIO_CONFIGURADO` y crea la cuenta propietaria de n8n.
-Nginx solicitará primero el usuario de `.htpasswd-n8n`. Esta protección cubre
-la interfaz y las APIs administrativas, mientras que `/webhook/*` permanece
-público para que Meta pueda entregar mensajes.
+Después abre `https://DOMINIO_CONFIGURADO` para n8n y
+`https://DOMINIO_CONFIGURADO/operator/` para gestionar los pedidos. Nginx
+solicitará el usuario de `.htpasswd-n8n` en ambos casos. Solo
+`/webhook/orders/intake` permanece público; los endpoints de aprobación,
+resumen y cualquier otro webhook quedan bloqueados desde Internet.
 La contraseña de MariaDB se lee desde `.env.production`, se importa cifrada en
 la base interna de n8n y no se escribe dentro de los workflows.
 
@@ -222,8 +231,8 @@ descifrar las credenciales guardadas.
 
 El repositorio incluye dos automatizaciones:
 
-- `CI`: valida Docker Compose, los JSON de n8n y los scripts; después levanta
-  n8n y MariaDB, importa los workflows y comprueba el catálogo.
+- `CI`: valida Docker Compose, los JSON, PHP y los scripts; después levanta
+  n8n, MariaDB y el panel, importa los workflows y ejecuta una aprobación real.
 - `Deploy production`: despliega manualmente la rama `main` en la máquina
   remota mediante SSH.
 

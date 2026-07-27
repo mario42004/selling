@@ -38,6 +38,11 @@ jobs:
           sh -n scripts/bootstrap-production.sh
           node --check scripts/render-n8n-mariadb-credential.mjs
 
+      - name: Validate operator PHP
+        run: |
+          php -l operator/public/index.php
+          php -l operator/public/health.php
+
   smoke-test:
     name: Start Docker stack
     runs-on: ubuntu-latest
@@ -49,12 +54,13 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Start services
-        run: docker compose --env-file .env.example -f compose.yaml up -d
+        run: docker compose --env-file .env.example -f compose.yaml up -d --build
 
-      - name: Wait for n8n
+      - name: Wait for services
         run: |
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:5678/healthz >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:5678/healthz >/dev/null \
+              && curl --fail --silent http://127.0.0.1:5680/health.php >/dev/null; then
               exit 0
             fi
             sleep 2
@@ -74,6 +80,45 @@ jobs:
             n8n publish:workflow --id=local-payment-approval
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \
             n8n publish:workflow --id=local-daily-summary
+          docker compose --env-file .env.example -f compose.yaml restart n8n
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:5678/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Exercise operator approval flow
+        run: |
+          response=$(curl --fail --silent --show-error \
+            -X POST http://127.0.0.1:5678/webhook/orders/intake \
+            -H 'Content-Type: application/json' \
+            --data "{\"external_message_id\":\"ci-${GITHUB_RUN_ID}\",\"customer_name\":\"Cliente CI\",\"phone\":\"+34000000000\",\"address\":\"Dirección CI\",\"message\":\"una agua grande\"}")
+          order_id=$(printf '%s' "$response" | jq -er '.order_id')
+
+          curl --fail --silent --show-error \
+            -c /tmp/operator-cookies.txt \
+            http://127.0.0.1:5680/ > /tmp/operator-page.html
+          grep -F 'Cliente CI' /tmp/operator-page.html
+          csrf=$(grep -o 'name="csrf" value="[a-f0-9]*"' /tmp/operator-page.html | head -1 | cut -d'"' -f4)
+          test -n "$csrf"
+
+          status=$(curl --silent --show-error \
+            -o /dev/null \
+            -w '%{http_code}' \
+            -b /tmp/operator-cookies.txt \
+            -X POST http://127.0.0.1:5680/ \
+            --data-urlencode "csrf=$csrf" \
+            --data-urlencode "order_id=$order_id" \
+            --data-urlencode 'action=approve' \
+            --data-urlencode 'return_status=ALL')
+          test "$status" = '303'
+
+          docker compose --env-file .env.example -f compose.yaml exec -T mariadb \
+            mariadb -N -uorders_app -porders_dev_password whatsapp_orders \
+            -e "SELECT status FROM orders WHERE id = ${order_id};" | grep -Fx CONFIRMED
 
       - name: Verify MariaDB catalog
         run: |
