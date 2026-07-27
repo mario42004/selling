@@ -1,0 +1,6 @@
+.env
+.env.production
+.data/
+*.log
+.agents/
+.codex/

@@ -1,0 +1,86 @@
+{
+  "id": "local-payment-approval",
+  "name": "02 - Confirmación manual de pago",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "webhook-approval",
+      "name": "Recibir aprobación",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-480, 0],
+      "webhookId": "7c24b0d6-9e27-4d67-8b43-1d471d8d4c02",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "orders/approve",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "normalize-approval",
+      "name": "Validar aprobación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 0],
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst orderId = String(body.order_id ?? '');\nif (!/^\\d+$/.test(orderId)) throw new Error('order_id debe ser numérico');\nconst approvedBy = String(body.approved_by ?? 'operador-local').trim();\nreturn [{ json: {\n  order_id: Number(orderId),\n  approved_by_b64: Buffer.from(approvedBy, 'utf8').toString('base64')\n} }];"
+      }
+    },
+    {
+      "id": "approve-order",
+      "name": "Confirmar y descontar stock",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [0, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CALL approve_order({{ $json.order_id }}, CONVERT(FROM_BASE64('{{ $json.approved_by_b64 }}') USING utf8mb4));",
+        "options": {}
+      },
+      "credentials": {
+        "mySql": {
+          "id": "mariadb-orders",
+          "name": "MariaDB Pedidos"
+        }
+      }
+    },
+    {
+      "id": "format-approval",
+      "name": "Preparar confirmación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().flatMap((item) => Array.isArray(item.json) ? item.json : [item.json]);\nconst row = rows.find((item) => item?.result !== undefined);\nif (!row) return [{ json: { ok: false, error: 'MariaDB no devolvió un resultado' } }];\nconst result = typeof row.result === 'string' ? JSON.parse(row.result) : row.result;\nif (result.ok) result.customer_confirmation = `Pedido #${result.order_id} confirmado. Total: ${result.total} €`;\nreturn [{ json: result }];"
+      }
+    },
+    {
+      "id": "respond-approval",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [480, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Recibir aprobación": { "main": [[{ "node": "Validar aprobación", "type": "main", "index": 0 }]] },
+    "Validar aprobación": { "main": [[{ "node": "Confirmar y descontar stock", "type": "main", "index": 0 }]] },
+    "Confirmar y descontar stock": { "main": [[{ "node": "Preparar confirmación", "type": "main", "index": 0 }]] },
+    "Preparar confirmación": { "main": [[{ "node": "Responder", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
