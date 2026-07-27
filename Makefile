@@ -1,7 +1,7 @@
 .PHONY: up down logs import publish setup db test-db reset
 
 up:
-	docker compose up -d
+	docker compose up -d --build
 
 down:
 	docker compose down
@@ -29,4 +29,3 @@ test-db:
 
 reset:
 	docker compose down -v
-

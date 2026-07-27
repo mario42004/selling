@@ -58,6 +58,30 @@ services:
     networks:
       - backend
 
+  operator:
+    build:
+      context: ./operator
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: 3306
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      TZ: ${TZ:-Europe/Madrid}
+    ports:
+      - "127.0.0.1:5680:80"
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/health.php') === \"ok\\n\" ? 0 : 1);"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - backend
+
 networks:
   backend:
     driver: bridge

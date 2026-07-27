@@ -39,6 +39,28 @@ services:
       - n8n_data:/home/node/.n8n
       - ./n8n:/workspace/n8n:ro
 
+  operator:
+    build:
+      context: ./operator
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: 3306
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-whatsapp_orders}
+      MARIADB_USER: ${MARIADB_USER:-orders_app}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-orders_dev_password}
+      TZ: ${TZ:-Europe/Madrid}
+    ports:
+      - "127.0.0.1:5680:80"
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/health.php') === \"ok\\n\" ? 0 : 1);"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
 volumes:
   mariadb_data:
   n8n_data:

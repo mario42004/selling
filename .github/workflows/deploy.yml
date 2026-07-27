@@ -67,7 +67,8 @@ jobs:
           git switch main
           git pull --ff-only origin main
 
-          docker compose --env-file .env.production -f compose.prod.yaml pull
+          docker compose --env-file .env.production -f compose.prod.yaml pull mariadb n8n
+          docker compose --env-file .env.production -f compose.prod.yaml build --pull operator
           docker compose --env-file .env.production -f compose.prod.yaml up -d --remove-orphans
           sh scripts/bootstrap-production.sh
           docker compose --env-file .env.production -f compose.prod.yaml ps
