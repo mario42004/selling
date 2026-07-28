@@ -13,6 +13,7 @@ services:
     volumes:
       - mariadb_data:/var/lib/mysql
       - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/migrations/002_catalog_conversations.sql:/docker-entrypoint-initdb.d/002_catalog_conversations.sql:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
@@ -55,6 +56,8 @@ services:
       TZ: ${TZ:-Europe/Madrid}
     ports:
       - "127.0.0.1:5680:80"
+    volumes:
+      - ./operator/uploads:/var/www/html/uploads
     healthcheck:
       test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/health.php') === \"ok\\n\" ? 0 : 1);"]
       interval: 10s

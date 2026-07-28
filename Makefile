@@ -1,4 +1,4 @@
-.PHONY: up down logs import publish setup db test-db reset
+.PHONY: up down logs import publish setup db migrate test-db reset
 
 up:
 	docker compose up -d --build
@@ -23,6 +23,9 @@ setup: up import publish
 
 db:
 	docker compose exec mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders
+
+migrate:
+	docker compose exec -T mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders < db/migrations/002_catalog_conversations.sql
 
 test-db:
 	docker compose exec -T mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders -e "SELECT sku,name,price,stock FROM products ORDER BY id;"

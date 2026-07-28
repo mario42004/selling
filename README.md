@@ -111,6 +111,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `compose.yaml`: n8n, MariaDB y panel de operador.
 - `operator/`: interfaz protegida para gestionar pedidos.
 - `db/init/001_schema.sql`: tablas, catálogo, procedimientos y vista diaria.
+- `db/migrations/002_catalog_conversations.sql`: catálogo con imágenes, variantes, conversaciones y preparación del vendedor conversacional.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -123,6 +124,7 @@ make up       # iniciar servicios
 make logs     # seguir los logs
 make import   # reimportar credencial y flujos
 make publish  # publicar flujos y reiniciar n8n
+make migrate  # aplicar migraciones de catálogo en desarrollo local
 make down     # detener servicios sin borrar datos
 make reset    # borrar volúmenes y reconstruir desde cero
 ```
@@ -182,6 +184,14 @@ workflows:
 
 ```bash
 sh scripts/bootstrap-production.sh
+```
+
+Si el despliegue ya tenía datos antes de incorporar catálogo con variantes e
+imágenes, aplica la migración una vez:
+
+```bash
+sh scripts/apply-migrations.sh
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 ```
 
 Prepara la autenticación adicional de Nginx:
