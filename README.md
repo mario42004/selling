@@ -223,6 +223,11 @@ Los roles operativos no deben quedar sin tienda asignada. El vendedor y el
 gerente de ciudad deben tener ciudad y tienda; proveedor y despachador trabajan
 sobre las tiendas asignadas.
 
+En el catálogo, cada producto se crea asociado a una tienda propietaria. La
+ciudad agrupa tiendas: un gerente de ciudad o admin puede trasladar existencias
+entre tiendas de la misma ciudad desde la sección Catálogo. Los roles de tienda
+no pueden hacer traslados entre tiendas.
+
 Prepara la autenticación adicional de Nginx:
 
 ```bash

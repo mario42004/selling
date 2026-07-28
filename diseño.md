@@ -162,6 +162,10 @@ Cada producto, pedido y usuario interno debe poder relacionarse con una tienda.
 Cada tienda pertenece a una zona y ciudad. Los permisos se calculan por ese
 alcance.
 
+La ciudad representa un grupo de tiendas. Por eso el gerente de ciudad puede
+trasladar existencias entre tiendas de esa misma ciudad, mientras que los roles
+asociados a una sola tienda no pueden mover stock fuera de su tienda.
+
 Ejemplo:
 
 - Admin ve todo.
