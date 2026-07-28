@@ -62,6 +62,24 @@ No puede:
 - Ver estadísticas globales.
 - Ver pedidos de zonas o tiendas no asignadas, salvo que el admin lo permita.
 
+#### Vendedor
+
+Responsable comercial asociado a una ciudad y tienda.
+
+Puede:
+
+- Ver pedidos de su tienda asignada.
+- Ver y actualizar catálogo de su tienda asignada cuando el admin lo permita.
+- Ver disponibilidad de productos de su tienda.
+- Dar seguimiento operativo a compradores de su tienda.
+
+No puede:
+
+- Aprobar pagos.
+- Crear usuarios.
+- Ver tiendas no asignadas.
+- Ver estadísticas globales.
+
 #### Despachador
 
 Responsable de revisar pagos y preparar despacho.
@@ -121,22 +139,22 @@ No puede:
 
 ## Matriz de permisos
 
-| Funcionalidad | Proveedor | Despachador | Gerente de ciudad | Admin |
-| --- | --- | --- | --- | --- |
-| Ver catálogo asignado | Sí | Opcional | Sí | Sí |
-| Crear producto | Sí | No | Sí, en tiendas asignadas | Sí |
-| Editar producto | Sí | No | Sí, en tiendas asignadas | Sí |
-| Subir imágenes | Sí | No | Sí, en tiendas asignadas | Sí |
-| Actualizar stock | Sí | No | Sí, en tiendas asignadas | Sí |
-| Ver pedidos | Limitado | Sí, asignados | Sí, por alcance | Sí |
-| Ver comprobantes | No | Sí | Sí, por alcance | Sí |
-| Aprobar pago | No | Sí | Sí, por alcance | Sí |
-| Rechazar pago | No | Sí | Sí, por alcance | Sí |
-| Marcar despachado | No | Sí | Sí, por alcance | Sí |
-| Ver tabla de envíos | No | Sí, asignada | Sí, por alcance | Sí |
-| Ver estadísticas | No | No | Sí, por alcance | Sí |
-| Crear usuarios | No | No | No | Sí |
-| Asignar roles | No | No | No | Sí |
+| Funcionalidad | Vendedor | Proveedor | Despachador | Gerente de ciudad | Admin |
+| --- | --- | --- | --- | --- | --- |
+| Ver catálogo asignado | Sí | Sí | Opcional | Sí | Sí |
+| Crear producto | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
+| Editar producto | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
+| Subir imágenes | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
+| Actualizar stock | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
+| Ver pedidos | Sí, tienda asignada | Limitado | Sí, asignados | Sí, por alcance | Sí |
+| Ver comprobantes | No | No | Sí | Sí, por alcance | Sí |
+| Aprobar pago | No | No | Sí | Sí, por alcance | Sí |
+| Rechazar pago | No | No | Sí | Sí, por alcance | Sí |
+| Marcar despachado | No | No | Sí | Sí, por alcance | Sí |
+| Ver tabla de envíos | No | No | Sí, asignada | Sí, por alcance | Sí |
+| Ver estadísticas | No | No | No | Sí, por alcance | Sí |
+| Crear usuarios | No | No | No | No | Sí |
+| Asignar roles | No | No | No | No | Sí |
 
 ## Alcance por ciudad, zona y tienda
 
@@ -147,7 +165,8 @@ alcance.
 Ejemplo:
 
 - Admin ve todo.
-- Gerente de Bogotá Norte ve pedidos y catálogo de Bogotá Norte.
+- Gerente de Bogotá Norte ve pedidos y catálogo de Bogotá Norte y de sus tiendas asignadas.
+- Vendedor de Tienda Centro trabaja solo sobre Tienda Centro.
 - Despachador de Tienda Centro ve pedidos asignados a esa tienda.
 - Proveedor de Tienda Centro actualiza solo productos de esa tienda.
 
@@ -445,6 +464,7 @@ Campos:
 Roles válidos:
 
 - `PROVIDER`
+- `SELLER`
 - `DISPATCHER`
 - `CITY_MANAGER`
 - `ADMIN`
@@ -806,7 +826,7 @@ Tareas:
 - Crear cierre de sesión.
 - Crear usuario admin inicial por variables de entorno o script.
 - Crear CRUD de usuarios para admin.
-- Implementar roles `PROVIDER`, `DISPATCHER`, `CITY_MANAGER`, `ADMIN`.
+- Implementar roles `SELLER`, `PROVIDER`, `DISPATCHER`, `CITY_MANAGER`, `ADMIN`.
 - Implementar asignación de ciudades, zonas y tiendas.
 - Filtrar vistas y acciones según rol.
 - Registrar auditoría de acciones sensibles.

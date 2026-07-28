@@ -27,8 +27,9 @@ if (!isset($_SESSION['csrf'])) {
 }
 
 const ORDER_STATUSES = ['ALL', 'PENDING_PAYMENT', 'CONFIRMED', 'REJECTED', 'CANCELLED', 'DISPATCHED'];
-const ROLES = ['PROVIDER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'];
+const ROLES = ['SELLER', 'PROVIDER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'];
 const ROLE_LABELS = [
+    'SELLER' => 'Vendedor',
     'PROVIDER' => 'Proveedor',
     'DISPATCHER' => 'Despachador',
     'CITY_MANAGER' => 'Gerente de ciudad',
@@ -171,8 +172,8 @@ function can(array $user, string $permission): bool
 {
     $role = (string) $user['role'];
     return match ($permission) {
-        'catalog.write' => in_array($role, ['PROVIDER', 'CITY_MANAGER', 'ADMIN'], true),
-        'orders.view' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
+        'catalog.write' => in_array($role, ['SELLER', 'PROVIDER', 'CITY_MANAGER', 'ADMIN'], true),
+        'orders.view' => in_array($role, ['SELLER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
         'orders.approve' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
         'shipments.view' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
         'stats.view' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
@@ -436,6 +437,21 @@ function saveUser(PDO $pdo): int
     if ($name === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || !in_array($role, ROLES, true)) {
         throw new RuntimeException('Nombre, email y rol son obligatorios.');
     }
+    $assignedCityIds = normalizeIds($_POST['assigned_city_ids'] ?? []);
+    $assignedStoreIds = normalizeIds($_POST['assigned_store_ids'] ?? []);
+    if ($role !== 'ADMIN' && $assignedStoreIds === []) {
+        throw new RuntimeException('Los roles operativos deben tener al menos una tienda asignada.');
+    }
+    if (in_array($role, ['SELLER', 'CITY_MANAGER'], true) && $assignedCityIds === []) {
+        throw new RuntimeException('Vendedor y gerente de ciudad deben tener al menos una ciudad asignada.');
+    }
+    if ($assignedStoreIds !== []) {
+        $placeholders = implode(',', array_fill(0, count($assignedStoreIds), '?'));
+        $statement = $pdo->prepare("SELECT DISTINCT city_id FROM stores WHERE id IN ({$placeholders})");
+        $statement->execute($assignedStoreIds);
+        $storeCityIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+        $assignedCityIds = array_values(array_unique(array_merge($assignedCityIds, $storeCityIds)));
+    }
 
     $pdo->beginTransaction();
     try {
@@ -460,11 +476,11 @@ function saveUser(PDO $pdo): int
         }
 
         $cityStatement = $pdo->prepare('INSERT IGNORE INTO user_city_assignments (user_id, city_id) VALUES (?, ?)');
-        foreach (normalizeIds($_POST['assigned_city_ids'] ?? []) as $cityId) {
+        foreach ($assignedCityIds as $cityId) {
             $cityStatement->execute([$savedId, $cityId]);
         }
         $storeStatement = $pdo->prepare('INSERT IGNORE INTO user_store_assignments (user_id, store_id) VALUES (?, ?)');
-        foreach (normalizeIds($_POST['assigned_store_ids'] ?? []) as $storeId) {
+        foreach ($assignedStoreIds as $storeId) {
             $storeStatement->execute([$savedId, $storeId]);
         }
         $pdo->commit();
@@ -670,7 +686,15 @@ $editUserCityIds = $editUserStoreIds = [];
 if ($pdo instanceof PDO && $user !== null) {
     $cities = $pdo->query('SELECT * FROM cities ORDER BY name')->fetchAll();
     $zones = $pdo->query('SELECT z.*, c.name AS city_name FROM zones z JOIN cities c ON c.id = z.city_id ORDER BY c.name, z.name')->fetchAll();
-    $stores = $pdo->query('SELECT s.*, c.name AS city_name, z.name AS zone_name FROM stores s JOIN cities c ON c.id = s.city_id LEFT JOIN zones z ON z.id = s.zone_id ORDER BY c.name, z.name, s.name')->fetchAll();
+    $stores = $pdo->query(
+        "SELECT s.*, c.name AS city_name, z.name AS zone_name,
+          (SELECT COUNT(*) FROM products p WHERE p.store_id = s.id) AS products_count,
+          (SELECT COUNT(*) FROM orders o WHERE o.store_id = s.id) AS orders_count
+         FROM stores s
+         JOIN cities c ON c.id = s.city_id
+         LEFT JOIN zones z ON z.id = s.zone_id
+         ORDER BY c.name, z.name, s.name"
+    )->fetchAll();
     $visibleStores = $stores;
     if ($user['role'] !== 'ADMIN') {
         $storeIds = assignedStoreIds($pdo, $user);
@@ -807,7 +831,7 @@ if ($editVariants === []) {
 }
 $decodedAliases = json_decode((string) ($formProduct['aliases'] ?? '[]'), true);
 $aliasesText = is_array($decodedAliases) ? implode("\n", $decodedAliases) : '';
-$formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'PROVIDER', 'active' => 1];
+$formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SELLER', 'active' => 1];
 ?>
 <!doctype html>
 <html lang="es">
@@ -959,18 +983,19 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'PR
         <div class="grid">
           <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="city"><h2>Crear ciudad</h2><label><span>Nombre</span><input name="city_name" required></label><button class="primary" type="submit">Guardar ciudad</button></form>
           <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="zone"><h2>Crear zona</h2><label><span>Ciudad</span><select name="city_id"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>"><?= escape($city['name']) ?></option><?php endforeach; ?></select></label><label><span>Zona</span><input name="zone_name" required></label><button class="primary" type="submit">Guardar zona</button></form>
-          <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="store"><h2>Crear tienda</h2><label><span>Ciudad</span><select name="city_id"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>"><?= escape($city['name']) ?></option><?php endforeach; ?></select></label><label><span>Zona</span><select name="zone_id"><option value="">Sin zona</option><?php foreach ($zones as $zone): ?><option value="<?= (int) $zone['id'] ?>"><?= escape($zone['city_name'] . ' · ' . $zone['name']) ?></option><?php endforeach; ?></select></label><label><span>Tienda</span><input name="store_name" required></label><label><span>Dirección</span><input name="store_address"></label><label><span>Teléfono</span><input name="store_phone"></label><button class="primary" type="submit">Guardar tienda</button></form>
+          <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="store"><h2>Crear tienda</h2><p class="muted">La tienda es el centro de acción: a ella se asignan vendedores, proveedores, despachadores, gerentes, catálogo y pedidos.</p><label><span>Ciudad</span><select name="city_id"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>"><?= escape($city['name']) ?></option><?php endforeach; ?></select></label><label><span>Zona</span><select name="zone_id"><option value="">Sin zona</option><?php foreach ($zones as $zone): ?><option value="<?= (int) $zone['id'] ?>"><?= escape($zone['city_name'] . ' · ' . $zone['name']) ?></option><?php endforeach; ?></select></label><label><span>Nombre de tienda</span><input name="store_name" required placeholder="Tienda Centro"></label><label><span>Dirección</span><input name="store_address" placeholder="Dirección física o referencia"></label><label><span>Teléfono</span><input name="store_phone" placeholder="Contacto operativo"></label><button class="primary" type="submit">Guardar tienda</button></form>
         </div>
-        <div class="panel"><h2>Tiendas</h2><table><thead><tr><th>Ciudad</th><th>Zona</th><th>Tienda</th><th>Dirección</th></tr></thead><tbody><?php foreach ($stores as $store): ?><tr><td><?= escape($store['city_name']) ?></td><td><?= escape($store['zone_name'] ?? '') ?></td><td><?= escape($store['name']) ?></td><td><?= escape($store['address']) ?></td></tr><?php endforeach; ?></tbody></table></div>
+        <div class="panel"><h2>Centros de acción</h2><table><thead><tr><th>Ciudad</th><th>Zona</th><th>Tienda</th><th>Catálogo</th><th>Pedidos</th><th>Contacto</th></tr></thead><tbody><?php foreach ($stores as $store): ?><tr><td><?= escape($store['city_name']) ?></td><td><?= escape($store['zone_name'] ?? '') ?></td><td><strong><?= escape($store['name']) ?></strong><br><span class="muted"><?= escape($store['address']) ?></span></td><td><?= (int) $store['products_count'] ?></td><td><?= (int) $store['orders_count'] ?></td><td><?= escape($store['phone']) ?></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
     <?php elseif ($view === 'users' && can($user, 'users.manage')): ?>
       <section class="split">
         <form class="panel stacked" method="post">
           <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_user"><input type="hidden" name="view" value="users"><input type="hidden" name="user_id" value="<?= escape((string) $formUser['id']) ?>">
           <h2><?= $editUser ? 'Editar usuario' : 'Crear usuario' ?></h2>
+          <p class="muted">La ciudad y la tienda definen qué puede ver y operar cada usuario. Vendedor y gerente de ciudad deben tener ambas asignadas.</p>
           <div class="fields"><label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label><label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label><label><span>Rol</span><select name="role"><?php foreach (ROLES as $role): ?><option value="<?= escape($role) ?>" <?= $formUser['role'] === $role ? 'selected' : '' ?>><?= escape(roleLabel($role)) ?></option><?php endforeach; ?></select></label><label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label><label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label></div>
-          <label><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select></label>
-          <label><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select></label>
+          <label><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select><small class="muted">Para gerente de ciudad y vendedor es obligatorio.</small></label>
+          <label><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select><small class="muted">Obligatorio para vendedor, proveedor, despachador y gerente.</small></label>
           <div class="actions"><button class="primary" type="submit">Guardar usuario</button><?php if ($editUser): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'users')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
         <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape(roleLabel($listedUser['role'])) ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
@@ -990,7 +1015,7 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'PR
           <article class="order">
             <div class="head"><div class="title"><h2>Pedido #<?= (int) $order['id'] ?> · <?= escape($order['customer_name']) ?></h2><span class="badge <?= escape($order['status']) ?>"><?= escape(statusLabel($order['status'])) ?></span></div><strong>$<?= money($order['total']) ?></strong></div>
             <div class="body"><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($order['city_name'] ?? '') . ' · ' . ($order['zone_name'] ?? '') . ' · ' . ($order['store_name'] ?? '')) ?></div><div class="fact"><span>Teléfono</span><a href="tel:<?= escape($order['phone']) ?>"><?= escape($order['phone']) ?></a></div><div class="fact"><span>Dirección</span><?= escape($order['delivery_address']) ?></div><div class="fact"><span>Pedido original</span><?= nl2br(escape($order['raw_message'])) ?></div><?php if ($order['payment_proof_url']): ?><div class="fact"><span>Comprobante</span><a href="<?= escape(imageSrc($basePath, $order['payment_proof_url'])) ?>" target="_blank" rel="noopener">Ver imagen</a></div><?php endif; ?><?php if ($order['reviewer_name']): ?><div class="fact"><span>Revisado por</span><?= escape($order['reviewer_name']) ?></div><?php endif; ?></div><div class="items"><?php foreach ($order['items'] as $item): ?><div class="item"><?php if ($item['image_url']): ?><img src="<?= escape(imageSrc($basePath, $item['image_url'])) ?>" alt="" loading="lazy"><?php else: ?><span></span><?php endif; ?><div><strong><?= (int) $item['quantity'] ?> x <?= escape($item['product_name']) ?></strong><br><small><?= escape($item['sku']) ?><?= $item['size'] ? ' · talla ' . escape($item['size']) : '' ?> · $<?= money($item['unit_price']) ?></small></div><strong>$<?= money((float) $item['quantity'] * (float) $item['unit_price']) ?></strong></div><?php endforeach; ?></div></div>
-            <div class="actions"><?php if ($order['status'] === 'PENDING_PAYMENT'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form><?php elseif ($order['status'] === 'CONFIRMED'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form><?php endif; ?></div>
+            <div class="actions"><?php if (can($user, 'orders.approve') && $order['status'] === 'PENDING_PAYMENT'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form><?php elseif (can($user, 'orders.approve') && $order['status'] === 'CONFIRMED'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form><?php endif; ?></div>
           </article>
         <?php endforeach; ?>
         <?php if ($orders === []): ?><div class="empty">No hay pedidos visibles en este estado.</div><?php endif; ?>

@@ -212,6 +212,17 @@ El panel queda en `https://DOMINIO_CONFIGURADO/operator/`. Desde allí el admin
 puede crear proveedores, despachadores y gerentes de ciudad, además de crear
 ciudades, zonas, tiendas y asignaciones.
 
+Orden recomendado dentro del panel:
+
+1. Crear ciudad.
+2. Crear zona, si aplica.
+3. Crear tienda como centro de acción.
+4. Crear usuarios y asignarles ciudad y tienda.
+
+Los roles operativos no deben quedar sin tienda asignada. El vendedor y el
+gerente de ciudad deben tener ciudad y tienda; proveedor y despachador trabajan
+sobre las tiendas asignadas.
+
 Prepara la autenticación adicional de Nginx:
 
 ```bash
