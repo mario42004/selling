@@ -27,11 +27,12 @@ if (!isset($_SESSION['csrf'])) {
 }
 
 const ORDER_STATUSES = ['ALL', 'PENDING_PAYMENT', 'CONFIRMED', 'REJECTED', 'CANCELLED', 'DISPATCHED'];
-const ROLES = ['SELLER', 'PROVIDER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'];
+const ROLES = ['SELLER', 'PROVIDER', 'DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'];
 const ROLE_LABELS = [
     'SELLER' => 'Vendedor',
     'PROVIDER' => 'Proveedor',
     'DISPATCHER' => 'Despachador',
+    'STORE_MANAGER' => 'Gerente de tienda',
     'CITY_MANAGER' => 'Gerente de ciudad',
     'ADMIN' => 'Admin',
 ];
@@ -172,11 +173,12 @@ function can(array $user, string $permission): bool
 {
     $role = (string) $user['role'];
     return match ($permission) {
-        'catalog.write' => in_array($role, ['SELLER', 'PROVIDER', 'CITY_MANAGER', 'ADMIN'], true),
-        'orders.view' => in_array($role, ['SELLER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
+        'catalog.write' => in_array($role, ['SELLER', 'PROVIDER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'orders.view' => in_array($role, ['SELLER', 'DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
         'orders.approve' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
-        'shipments.view' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
-        'stats.view' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
+        'shipments.view' => in_array($role, ['DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'stats.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'inventory.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
         'inventory.transfer' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
         'users.manage', 'locations.manage' => $role === 'ADMIN',
         default => false,
@@ -584,8 +586,8 @@ function saveUser(PDO $pdo): int
     if ($role !== 'ADMIN' && $assignedStoreIds === []) {
         throw new RuntimeException('Los roles operativos deben tener al menos una tienda asignada.');
     }
-    if (in_array($role, ['SELLER', 'CITY_MANAGER'], true) && $assignedCityIds === []) {
-        throw new RuntimeException('Vendedor y gerente de ciudad deben tener al menos una ciudad asignada.');
+    if (in_array($role, ['SELLER', 'STORE_MANAGER', 'CITY_MANAGER'], true) && $assignedCityIds === []) {
+        throw new RuntimeException('Vendedor, gerente de tienda y gerente de ciudad deben tener al menos una ciudad asignada.');
     }
     if ($assignedStoreIds !== []) {
         $placeholders = implode(',', array_fill(0, count($assignedStoreIds), '?'));
@@ -699,6 +701,9 @@ if ($user !== null && can($user, 'catalog.write')) {
 }
 if ($user !== null && can($user, 'shipments.view')) {
     $allowedViews[] = 'shipments';
+}
+if ($user !== null && can($user, 'inventory.view')) {
+    $allowedViews[] = 'inventory';
 }
 if ($user !== null && can($user, 'stats.view')) {
     $allowedViews[] = 'stats';
@@ -826,7 +831,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
 }
 
 $counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
-$orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = $transferVariants = [];
+$orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = $transferVariants = $inventoryStore = $inventoryCity = [];
 $visibleStores = [];
 $editProduct = null;
 $editVariants = [];
@@ -933,6 +938,39 @@ if ($pdo instanceof PDO && $user !== null) {
         $transferVariants = $statement->fetchAll();
     }
 
+    if (can($user, 'inventory.view')) {
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'ibs', $params);
+        $statement = $pdo->prepare(
+            "SELECT ibs.*
+             FROM inventory_by_store ibs
+             WHERE {$where}
+             ORDER BY ibs.city_name, ibs.store_name, ibs.product_name, ibs.size"
+        );
+        $statement->execute($params);
+        $inventoryStore = $statement->fetchAll();
+
+        if ($user['role'] === 'ADMIN') {
+            $statement = $pdo->query('SELECT * FROM inventory_by_city ORDER BY city_name, product_name, size');
+            $inventoryCity = $statement->fetchAll();
+        } else {
+            $params = [];
+            $where = scopedWhere($pdo, $user, 'ibs', $params);
+            $statement = $pdo->prepare(
+                "SELECT ibs.city_id, ibs.city_name, ibs.product_name, ibs.category, ibs.type, ibs.brand, ibs.color, ibs.size,
+                        SUM(ibs.stock) AS city_stock,
+                        SUM(ibs.reserved_stock) AS city_reserved_stock,
+                        COUNT(DISTINCT ibs.store_id) AS stores_with_product
+                 FROM inventory_by_store ibs
+                 WHERE {$where}
+                 GROUP BY ibs.city_id, ibs.city_name, ibs.product_name, ibs.category, ibs.type, ibs.brand, ibs.color, ibs.size
+                 ORDER BY ibs.city_name, ibs.product_name, ibs.size"
+            );
+            $statement->execute($params);
+            $inventoryCity = $statement->fetchAll();
+        }
+    }
+
     if (can($user, 'shipments.view')) {
         $params = [];
         $where = scopedWhere($pdo, $user, 'o', $params);
@@ -967,6 +1005,19 @@ if ($pdo instanceof PDO && $user !== null) {
         );
         $statement->execute($params);
         $stats['stores'] = $statement->fetchAll();
+
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'p', $params);
+        $statement = $pdo->prepare(
+            "SELECT COALESCE(SUM(pv.stock), 0) AS stock_units,
+                    COUNT(DISTINCT p.id) AS products_count,
+                    COUNT(DISTINCT p.store_id) AS stores_count
+             FROM products p
+             JOIN product_variants pv ON pv.product_id = p.id
+             WHERE {$where} AND p.deleted_at IS NULL AND p.active = TRUE AND pv.active = TRUE"
+        );
+        $statement->execute($params);
+        $stats['inventory'] = $statement->fetch() ?: ['stock_units' => 0, 'products_count' => 0, 'stores_count' => 0];
     }
 
     if (can($user, 'users.manage')) {
@@ -1099,7 +1150,7 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
   <?php elseif ($user): ?>
     <nav class="tabs">
       <?php foreach ($allowedViews as $allowedView): if ($allowedView === 'login') continue; ?>
-        <a class="tab <?= $view === $allowedView ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, $allowedView)) ?>"><?= escape(match ($allowedView) { 'orders' => 'Pedidos', 'catalog' => 'Catálogo', 'shipments' => 'Envíos', 'stats' => 'Estadísticas', 'locations' => 'Ubicaciones', 'users' => 'Usuarios', default => $allowedView }) ?></a>
+        <a class="tab <?= $view === $allowedView ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, $allowedView)) ?>"><?= escape(match ($allowedView) { 'orders' => 'Pedidos', 'catalog' => 'Catálogo', 'shipments' => 'Envíos', 'inventory' => 'Inventario', 'stats' => 'Estadísticas', 'locations' => 'Ubicaciones', 'users' => 'Usuarios', default => $allowedView }) ?></a>
       <?php endforeach; ?>
     </nav>
 
@@ -1181,9 +1232,22 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
         </form>
         <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape(roleLabel($listedUser['role'])) ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
+    <?php elseif ($view === 'inventory' && can($user, 'inventory.view')): ?>
+      <section class="grid">
+        <div class="panel">
+          <h2>Inventario por tienda</h2>
+          <p class="muted">Cada tienda tiene su propio inventario. Las ventas descuentan la variante de la tienda asociada al producto vendido.</p>
+          <table><thead><tr><th>Ciudad</th><th>Tienda</th><th>Producto</th><th>Talla</th><th>Stock</th><th>Reservado</th><th>Precio</th></tr></thead><tbody><?php foreach ($inventoryStore as $row): ?><tr><td><?= escape($row['city_name']) ?></td><td><?= escape($row['store_name']) ?></td><td><?= escape($row['product_name']) ?><br><span class="muted"><?= escape(trim(($row['category'] ?? '') . ' · ' . ($row['type'] ?? ''), ' ·')) ?></span></td><td><?= escape($row['size']) ?></td><td><strong><?= (int) $row['stock'] ?></strong></td><td><?= (int) $row['reserved_stock'] ?></td><td>$<?= money($row['price']) ?></td></tr><?php endforeach; ?></tbody></table>
+        </div>
+        <div class="panel">
+          <h2>Inventario consolidado por ciudad</h2>
+          <p class="muted">El inventario de una ciudad es la suma del stock de todas sus tiendas visibles.</p>
+          <table><thead><tr><th>Ciudad</th><th>Producto</th><th>Talla</th><th>Stock ciudad</th><th>Tiendas</th></tr></thead><tbody><?php foreach ($inventoryCity as $row): ?><tr><td><?= escape($row['city_name']) ?></td><td><?= escape($row['product_name']) ?><br><span class="muted"><?= escape(trim(($row['category'] ?? '') . ' · ' . ($row['type'] ?? ''), ' ·')) ?></span></td><td><?= escape($row['size']) ?></td><td><strong><?= (int) $row['city_stock'] ?></strong></td><td><?= (int) $row['stores_with_product'] ?></td></tr><?php endforeach; ?></tbody></table>
+        </div>
+      </section>
     <?php elseif ($view === 'stats' && can($user, 'stats.view')): ?>
       <section class="grid">
-        <div class="summary"><div class="metric"><span>Ventas</span><strong>$<?= money($stats['summary']['sales_total'] ?? 0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int) ($stats['summary']['orders_count'] ?? 0) ?></strong></div><div class="metric"><span>Ticket promedio</span><strong>$<?= money($stats['summary']['average_ticket'] ?? 0) ?></strong></div></div>
+        <div class="summary"><div class="metric"><span>Ventas</span><strong>$<?= money($stats['summary']['sales_total'] ?? 0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int) ($stats['summary']['orders_count'] ?? 0) ?></strong></div><div class="metric"><span>Ticket promedio</span><strong>$<?= money($stats['summary']['average_ticket'] ?? 0) ?></strong></div><div class="metric"><span>Unidades en inventario</span><strong><?= (int) ($stats['inventory']['stock_units'] ?? 0) ?></strong></div><div class="metric"><span>Productos activos</span><strong><?= (int) ($stats['inventory']['products_count'] ?? 0) ?></strong></div><div class="metric"><span>Tiendas visibles</span><strong><?= (int) ($stats['inventory']['stores_count'] ?? 0) ?></strong></div></div>
         <div class="panel"><h2>Ventas por tienda</h2><table><thead><tr><th>Tienda</th><th>Pedidos</th><th>Ventas</th></tr></thead><tbody><?php foreach (($stats['stores'] ?? []) as $row): ?><tr><td><?= escape($row['store_name'] ?? 'Sin tienda') ?></td><td><?= (int) $row['orders_count'] ?></td><td>$<?= money($row['sales_total']) ?></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
     <?php elseif ($view === 'shipments'): ?>

@@ -118,6 +118,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `db/init/001_schema.sql`: tablas, catálogo, procedimientos y vista diaria.
 - `db/migrations/002_catalog_conversations.sql`: catálogo con imágenes, variantes, conversaciones y preparación del vendedor conversacional.
 - `db/migrations/003_roles_locations.sql`: usuarios, roles, ciudades, zonas, tiendas y permisos territoriales.
+- `db/migrations/006_inventory_views_store_manager.sql`: rol gerente de tienda, vistas de inventario por tienda y ciudad, y sincronización de pedidos con la tienda del producto vendido.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -219,14 +220,20 @@ Orden recomendado dentro del panel:
 3. Crear tienda como centro de acción.
 4. Crear usuarios y asignarles ciudad y tienda.
 
-Los roles operativos no deben quedar sin tienda asignada. El vendedor y el
-gerente de ciudad deben tener ciudad y tienda; proveedor y despachador trabajan
-sobre las tiendas asignadas.
+Los roles operativos no deben quedar sin tienda asignada. El vendedor, gerente
+de tienda y gerente de ciudad deben tener ciudad y tienda; proveedor y
+despachador trabajan sobre las tiendas asignadas.
 
 En el catálogo, cada producto se crea asociado a una tienda propietaria. La
 ciudad agrupa tiendas: un gerente de ciudad o admin puede trasladar existencias
 entre tiendas de la misma ciudad desde la sección Catálogo. Los roles de tienda
 no pueden hacer traslados entre tiendas.
+
+El inventario se maneja por tienda, producto y talla. Cuando se aprueba una
+venta, MariaDB vuelve a validar el stock y descuenta únicamente la variante de
+la tienda asociada al producto vendido. El inventario de ciudad se calcula como
+la suma de las tiendas visibles dentro de esa ciudad: admin ve todo, gerente de
+ciudad ve su alcance geográfico y gerente de tienda ve sus tiendas asignadas.
 
 Prepara la autenticación adicional de Nginx:
 

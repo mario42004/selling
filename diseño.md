@@ -99,6 +99,26 @@ No puede:
 - Modificar catálogo, salvo ajuste operativo explícito concedido por admin.
 - Ver estadísticas globales.
 
+#### Gerente de tienda
+
+Responsable operativo de una tienda asignada dentro de una ciudad.
+
+Puede:
+
+- Ver pedidos de su tienda.
+- Ver envíos de su tienda.
+- Ver inventario de su tienda.
+- Ver estadísticas y ventas de su tienda.
+- Crear y actualizar productos de su tienda si el admin le da ese alcance.
+- Ver el consolidado únicamente de las tiendas visibles para su usuario.
+
+No puede:
+
+- Aprobar pagos, salvo que además tenga rol de despachador o gerente de ciudad.
+- Trasladar inventario entre tiendas.
+- Ver inventario, ventas o pedidos de otras tiendas no asignadas.
+- Crear usuarios.
+
 #### Admin
 
 Responsable total del sistema.
@@ -139,22 +159,28 @@ No puede:
 
 ## Matriz de permisos
 
-| Funcionalidad | Vendedor | Proveedor | Despachador | Gerente de ciudad | Admin |
-| --- | --- | --- | --- | --- | --- |
-| Ver catálogo asignado | Sí | Sí | Opcional | Sí | Sí |
-| Crear producto | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
-| Editar producto | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
-| Subir imágenes | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
-| Actualizar stock | Sí, tienda asignada | Sí | No | Sí, en tiendas asignadas | Sí |
-| Ver pedidos | Sí, tienda asignada | Limitado | Sí, asignados | Sí, por alcance | Sí |
-| Ver comprobantes | No | No | Sí | Sí, por alcance | Sí |
-| Aprobar pago | No | No | Sí | Sí, por alcance | Sí |
-| Rechazar pago | No | No | Sí | Sí, por alcance | Sí |
-| Marcar despachado | No | No | Sí | Sí, por alcance | Sí |
-| Ver tabla de envíos | No | No | Sí, asignada | Sí, por alcance | Sí |
-| Ver estadísticas | No | No | No | Sí, por alcance | Sí |
-| Crear usuarios | No | No | No | No | Sí |
-| Asignar roles | No | No | No | No | Sí |
+| Funcionalidad | Vendedor | Proveedor | Despachador | Gerente de tienda | Gerente de ciudad | Admin |
+| --- | --- | --- | --- | --- | --- | --- |
+| Ver catálogo asignado | Sí | Sí | Opcional | Sí | Sí | Sí |
+| Crear producto | Sí, tienda asignada | Sí | No | Sí, tienda asignada | Sí, en tiendas asignadas | Sí |
+| Editar producto | Sí, tienda asignada | Sí | No | Sí, tienda asignada | Sí, en tiendas asignadas | Sí |
+| Subir imágenes | Sí, tienda asignada | Sí | No | Sí, tienda asignada | Sí, en tiendas asignadas | Sí |
+| Actualizar stock | Sí, tienda asignada | Sí | No | Sí, tienda asignada | Sí, en tiendas asignadas | Sí |
+| Trasladar stock entre tiendas | No | No | No | No | Sí, misma ciudad | Sí |
+| Ver inventario | Sí, tienda asignada | Sí, tienda asignada | Opcional | Sí, tienda asignada | Sí, por ciudad | Sí |
+| Ver pedidos | Sí, tienda asignada | Limitado | Sí, asignados | Sí, tienda asignada | Sí, por alcance | Sí |
+| Ver comprobantes | No | No | Sí | No | Sí, por alcance | Sí |
+| Aprobar pago | No | No | Sí | No | Sí, por alcance | Sí |
+| Rechazar pago | No | No | Sí | No | Sí, por alcance | Sí |
+| Marcar despachado | No | No | Sí | No | Sí, por alcance | Sí |
+| Ver tabla de envíos | No | No | Sí, asignada | Sí, tienda asignada | Sí, por alcance | Sí |
+| Ver estadísticas | No | No | No | Sí, tienda asignada | Sí, por alcance | Sí |
+| Crear usuarios | No | No | No | No | No | Sí |
+| Asignar roles | No | No | No | No | No | Sí |
+
+El rol `Gerente de tienda` se comporta como un responsable de una o varias
+tiendas asignadas: ve inventario, pedidos, envíos, ventas y estadísticas de su
+tienda, pero no puede aprobar pagos ni trasladar existencias entre tiendas.
 
 ## Alcance por ciudad, zona y tienda
 
@@ -165,6 +191,15 @@ alcance.
 La ciudad representa un grupo de tiendas. Por eso el gerente de ciudad puede
 trasladar existencias entre tiendas de esa misma ciudad, mientras que los roles
 asociados a una sola tienda no pueden mover stock fuera de su tienda.
+
+Regla de inventario:
+
+- Cada tienda maneja su propio inventario por producto, talla y variante.
+- El inventario de una ciudad es la suma del inventario de todas las tiendas de esa ciudad.
+- Una venta descuenta stock de la variante exacta vendida en la tienda propietaria del producto.
+- Antes de aprobar un pago, el sistema vuelve a validar stock para evitar vender unidades que ya se agotaron.
+- Admin y gerente de ciudad pueden ver el consolidado de ciudad dentro de su alcance.
+- Gerente de tienda ve el inventario y estadísticas de sus tiendas asignadas.
 
 Ejemplo:
 
@@ -470,6 +505,7 @@ Roles válidos:
 - `PROVIDER`
 - `SELLER`
 - `DISPATCHER`
+- `STORE_MANAGER`
 - `CITY_MANAGER`
 - `ADMIN`
 
@@ -858,7 +894,7 @@ Tareas:
 
 Resultado esperado:
 
-Proveedor, gerente de ciudad y admin pueden cargar catálogo sin tocar SQL, dentro de su alcance.
+Proveedor, gerente de tienda, gerente de ciudad y admin pueden cargar catálogo sin tocar SQL, dentro de su alcance.
 
 ### Etapa 4: mejorar panel de pedidos
 
@@ -879,13 +915,13 @@ Tareas:
 
 Resultado esperado:
 
-Despachador, gerente de ciudad y admin pueden revisar ventas reales y gestionar despacho según permisos.
+Despachador, gerente de ciudad y admin pueden aprobar ventas reales y gestionar despacho según permisos. Gerente de tienda puede ver pedidos y envíos de su tienda sin aprobar pagos.
 
 ### Etapa 5: estadísticas por periodo
 
 Objetivo:
 
-Dar visibilidad de ventas a admin y gerente de ciudad.
+Dar visibilidad de ventas a admin, gerente de ciudad y gerente de tienda.
 
 Tareas:
 
@@ -900,7 +936,7 @@ Tareas:
 
 Resultado esperado:
 
-Admin ve todo el negocio y gerente de ciudad ve sus ciudades, zonas o tiendas asignadas.
+Admin ve todo el negocio, gerente de ciudad ve sus ciudades, zonas o tiendas asignadas y gerente de tienda ve sus tiendas asignadas.
 
 ### Etapa 6: crear motor conversacional básico
 
@@ -1020,6 +1056,7 @@ El sistema se considera listo cuando:
 - Cada usuario ve solo las funcionalidades permitidas por su rol.
 - Cada usuario ve solo las ciudades, zonas o tiendas de su alcance, salvo admin.
 - Proveedor puede crear productos con fotos, tallas, cantidades y precios.
+- Gerente de tienda puede ver inventario, ventas y pedidos de sus tiendas asignadas.
 - Gerente de ciudad puede actualizar catálogo dentro de su alcance.
 - Gerente de ciudad puede ver estadísticas por periodo dentro de su alcance.
 - Despachador puede aprobar pagos y marcar despachos asignados.
@@ -1056,7 +1093,7 @@ Construir en este orden:
 3. Ciudades, zonas, tiendas y asignaciones.
 4. Panel de catálogo con alcance por tienda.
 5. Panel de pedidos con aprobación por rol y territorio.
-6. Estadísticas para admin y gerente de ciudad.
+6. Estadísticas para admin, gerente de ciudad y gerente de tienda.
 7. Conversación básica por WhatsApp.
 8. Envío de imágenes.
 9. Comprobante y aprobación.
