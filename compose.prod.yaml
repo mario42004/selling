@@ -12,6 +12,7 @@ services:
       - mariadb_data:/var/lib/mysql
       - ./db/init:/docker-entrypoint-initdb.d:ro
       - ./db/migrations/002_catalog_conversations.sql:/docker-entrypoint-initdb.d/002_catalog_conversations.sql:ro
+      - ./db/migrations/003_roles_locations.sql:/docker-entrypoint-initdb.d/003_roles_locations.sql:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -72,6 +73,9 @@ services:
       MARIADB_DATABASE: ${MARIADB_DATABASE}
       MARIADB_USER: ${MARIADB_USER}
       MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      OPERATOR_ADMIN_NAME: ${OPERATOR_ADMIN_NAME:-Admin}
+      OPERATOR_ADMIN_EMAIL: ${OPERATOR_ADMIN_EMAIL:?Define OPERATOR_ADMIN_EMAIL en .env.production}
+      OPERATOR_ADMIN_PASSWORD: ${OPERATOR_ADMIN_PASSWORD:?Define OPERATOR_ADMIN_PASSWORD en .env.production}
       TZ: ${TZ:-Europe/Madrid}
     ports:
       - "127.0.0.1:5680:80"

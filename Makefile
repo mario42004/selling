@@ -25,7 +25,7 @@ db:
 	docker compose exec mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders
 
 migrate:
-	docker compose exec -T mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders < db/migrations/002_catalog_conversations.sql
+	for migration in db/migrations/*.sql; do docker compose exec -T mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders < $$migration; done
 
 test-db:
 	docker compose exec -T mariadb mariadb -uorders_app -porders_dev_password whatsapp_orders -e "SELECT sku,name,price,stock FROM products ORDER BY id;"

@@ -26,16 +26,14 @@ if (!isset($_SESSION['csrf'])) {
     $_SESSION['csrf'] = bin2hex(random_bytes(32));
 }
 
-const ORDER_STATUSES = [
-    'ALL',
-    'PENDING_PAYMENT',
-    'CONFIRMED',
-    'REJECTED',
-    'CANCELLED',
-    'DISPATCHED',
+const ORDER_STATUSES = ['ALL', 'PENDING_PAYMENT', 'CONFIRMED', 'REJECTED', 'CANCELLED', 'DISPATCHED'];
+const ROLES = ['PROVIDER', 'DISPATCHER', 'CITY_MANAGER', 'ADMIN'];
+const ROLE_LABELS = [
+    'PROVIDER' => 'Proveedor',
+    'DISPATCHER' => 'Despachador',
+    'CITY_MANAGER' => 'Gerente de ciudad',
+    'ADMIN' => 'Admin',
 ];
-
-const VIEWS = ['orders', 'catalog', 'shipments'];
 
 function requiredEnvironment(string $name): string
 {
@@ -52,11 +50,9 @@ function database(): PDO
     if ($pdo instanceof PDO) {
         return $pdo;
     }
-
     $host = getenv('MARIADB_HOST') ?: 'mariadb';
     $port = getenv('MARIADB_PORT') ?: '3306';
     $name = requiredEnvironment('MARIADB_DATABASE');
-
     $pdo = new PDO(
         "mysql:host={$host};port={$port};dbname={$name};charset=utf8mb4",
         requiredEnvironment('MARIADB_USER'),
@@ -67,7 +63,6 @@ function database(): PDO
             PDO::ATTR_EMULATE_PREPARES => false,
         ]
     );
-
     return $pdo;
 }
 
@@ -93,31 +88,24 @@ function statusLabel(string $status): string
     };
 }
 
+function roleLabel(string $role): string
+{
+    return ROLE_LABELS[$role] ?? $role;
+}
+
 function viewUrl(string $basePath, string $view, array $params = []): string
 {
-    $query = array_merge(['view' => $view], $params);
     if ($view === 'orders' && $params === []) {
         return $basePath;
     }
-    return $basePath . '?' . http_build_query($query);
+    return $basePath . '?' . http_build_query(array_merge(['view' => $view], $params));
 }
 
-function redirectWithFlash(string $basePath, string $message, string $type, string $view, array $params = []): never
+function redirectWithFlash(string $basePath, string $message, string $type, string $view = 'orders', array $params = []): never
 {
     $_SESSION['flash'] = ['message' => $message, 'type' => $type];
     header('Location: ' . viewUrl($basePath, $view, $params), true, 303);
     exit;
-}
-
-function lockOrderStatus(PDO $pdo, int $orderId): string
-{
-    $statement = $pdo->prepare('SELECT status FROM orders WHERE id = ? FOR UPDATE');
-    $statement->execute([$orderId]);
-    $status = $statement->fetchColumn();
-    if (!is_string($status)) {
-        throw new RuntimeException('Pedido no encontrado');
-    }
-    return $status;
 }
 
 function slugPart(string $value): string
@@ -125,6 +113,106 @@ function slugPart(string $value): string
     $slug = strtolower(trim(iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value));
     $slug = preg_replace('/[^a-z0-9]+/', '-', $slug) ?: '';
     return trim($slug, '-') ?: 'producto';
+}
+
+function imageSrc(string $basePath, ?string $url): string
+{
+    $url = trim((string) $url);
+    if ($url === '') {
+        return '';
+    }
+    if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://') || str_starts_with($url, 'data:')) {
+        return $url;
+    }
+    return $basePath . ltrim($url, '/');
+}
+
+function normalizeIds(mixed $value): array
+{
+    if (!is_array($value)) {
+        $value = $value === null || $value === '' ? [] : [$value];
+    }
+    $ids = [];
+    foreach ($value as $candidate) {
+        $id = filter_var($candidate, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($id !== false) {
+            $ids[] = (int) $id;
+        }
+    }
+    return array_values(array_unique($ids));
+}
+
+function ensureBootstrapAdmin(PDO $pdo): void
+{
+    $count = (int) $pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
+    if ($count > 0) {
+        return;
+    }
+    $name = getenv('OPERATOR_ADMIN_NAME') ?: 'Admin';
+    $email = getenv('OPERATOR_ADMIN_EMAIL') ?: 'admin@example.com';
+    $password = getenv('OPERATOR_ADMIN_PASSWORD') ?: 'ChangeMe123!';
+    $statement = $pdo->prepare("INSERT INTO users (name, email, password_hash, role, active) VALUES (?, ?, ?, 'ADMIN', TRUE)");
+    $statement->execute([$name, strtolower($email), password_hash($password, PASSWORD_DEFAULT)]);
+}
+
+function currentUser(PDO $pdo): ?array
+{
+    $userId = $_SESSION['user_id'] ?? null;
+    if (!is_int($userId) && !ctype_digit((string) $userId)) {
+        return null;
+    }
+    $statement = $pdo->prepare('SELECT * FROM users WHERE id = ? AND active = TRUE');
+    $statement->execute([(int) $userId]);
+    $user = $statement->fetch();
+    return is_array($user) ? $user : null;
+}
+
+function can(array $user, string $permission): bool
+{
+    $role = (string) $user['role'];
+    return match ($permission) {
+        'catalog.write' => in_array($role, ['PROVIDER', 'CITY_MANAGER', 'ADMIN'], true),
+        'orders.view' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
+        'orders.approve' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
+        'shipments.view' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
+        'stats.view' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
+        'users.manage', 'locations.manage' => $role === 'ADMIN',
+        default => false,
+    };
+}
+
+function assignedStoreIds(PDO $pdo, array $user): array
+{
+    if ($user['role'] === 'ADMIN') {
+        return [];
+    }
+    $statement = $pdo->prepare('SELECT store_id FROM user_store_assignments WHERE user_id = ?');
+    $statement->execute([(int) $user['id']]);
+    $storeIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+    if ($user['role'] === 'CITY_MANAGER') {
+        $statement = $pdo->prepare(
+            'SELECT s.id FROM stores s JOIN user_city_assignments uca ON uca.city_id = s.city_id WHERE uca.user_id = ?'
+        );
+        $statement->execute([(int) $user['id']]);
+        $storeIds = array_merge($storeIds, array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN)));
+    }
+    return array_values(array_unique($storeIds));
+}
+
+function scopedWhere(PDO $pdo, array $user, string $alias, array &$params): string
+{
+    if ($user['role'] === 'ADMIN') {
+        return '1=1';
+    }
+    $storeIds = assignedStoreIds($pdo, $user);
+    if ($storeIds === []) {
+        return '1=0';
+    }
+    $placeholders = implode(',', array_fill(0, count($storeIds), '?'));
+    foreach ($storeIds as $storeId) {
+        $params[] = $storeId;
+    }
+    return "{$alias}.store_id IN ({$placeholders})";
 }
 
 function readAliases(string $aliasesText, string ...$fallbacks): string
@@ -142,11 +230,10 @@ function readAliases(string $aliasesText, string ...$fallbacks): string
             $aliases[] = $fallback;
         }
     }
-    $aliases = array_values(array_unique($aliases));
-    return json_encode($aliases, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    return json_encode(array_values(array_unique($aliases)), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
 }
 
-function uploadImage(string $basePath): ?string
+function uploadImage(): ?string
 {
     if (!isset($_FILES['image']) || !is_array($_FILES['image'])) {
         return null;
@@ -160,7 +247,6 @@ function uploadImage(string $basePath): ?string
     if ((int) $_FILES['image']['size'] > 6 * 1024 * 1024) {
         throw new RuntimeException('La imagen no puede pesar más de 6 MB.');
     }
-
     $tmpName = (string) $_FILES['image']['tmp_name'];
     $mime = (new finfo(FILEINFO_MIME_TYPE))->file($tmpName);
     $extension = match ($mime) {
@@ -169,36 +255,39 @@ function uploadImage(string $basePath): ?string
         'image/webp' => 'webp',
         default => throw new RuntimeException('Formato de imagen no permitido. Usa JPG, PNG o WebP.'),
     };
-
     $uploadDir = __DIR__ . '/uploads';
     if (!is_dir($uploadDir) && !mkdir($uploadDir, 0775, true)) {
         throw new RuntimeException('No se pudo crear la carpeta de imágenes.');
     }
-
     $filename = bin2hex(random_bytes(12)) . '.' . $extension;
-    $target = $uploadDir . '/' . $filename;
-    if (!move_uploaded_file($tmpName, $target)) {
+    if (!move_uploaded_file($tmpName, $uploadDir . '/' . $filename)) {
         throw new RuntimeException('No se pudo guardar la imagen.');
     }
-
     return 'uploads/' . $filename;
 }
 
-function imageSrc(string $basePath, ?string $url): string
+function assertStoreAccess(PDO $pdo, array $user, int $storeId): void
 {
-    $url = trim((string) $url);
-    if ($url === '') {
-        return '';
+    if ($user['role'] === 'ADMIN') {
+        return;
     }
-    if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://') || str_starts_with($url, 'data:')) {
-        return $url;
+    if (!in_array($storeId, assignedStoreIds($pdo, $user), true)) {
+        throw new RuntimeException('No tienes acceso a esa tienda.');
     }
-    return $basePath . ltrim($url, '/');
 }
 
-function saveProduct(PDO $pdo, string $basePath): int
+function saveProduct(PDO $pdo, array $user): int
 {
+    if (!can($user, 'catalog.write')) {
+        throw new RuntimeException('No tienes permiso para modificar catálogo.');
+    }
     $productId = filter_var($_POST['product_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $storeId = filter_var($_POST['store_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    if ($storeId === false) {
+        throw new RuntimeException('Selecciona una tienda.');
+    }
+    assertStoreAccess($pdo, $user, (int) $storeId);
+
     $name = trim((string) ($_POST['name'] ?? ''));
     $category = trim((string) ($_POST['category'] ?? ''));
     $type = trim((string) ($_POST['type'] ?? ''));
@@ -211,16 +300,15 @@ function saveProduct(PDO $pdo, string $basePath): int
     $salePrice = $salePriceRaw === '' ? null : filter_var($salePriceRaw, FILTER_VALIDATE_FLOAT);
     $active = isset($_POST['active']) ? 1 : 0;
     $imageUrl = trim((string) ($_POST['image_url'] ?? ''));
-    $uploadedImage = uploadImage($basePath);
+    $uploadedImage = uploadImage();
     if ($uploadedImage !== null) {
         $imageUrl = $uploadedImage;
     }
-
     if ($name === '' || $category === '' || $type === '') {
         throw new RuntimeException('Nombre, categoría y tipo son obligatorios.');
     }
     if ($price === false || $price < 0) {
-        throw new RuntimeException('El precio debe ser un número mayor o igual a cero.');
+        throw new RuntimeException('El precio debe ser válido.');
     }
     if ($salePriceRaw !== '' && ($salePrice === false || $salePrice < 0)) {
         throw new RuntimeException('El precio promocional debe ser válido.');
@@ -229,12 +317,8 @@ function saveProduct(PDO $pdo, string $basePath): int
     $sizes = $_POST['variant_size'] ?? [];
     $stocks = $_POST['variant_stock'] ?? [];
     $skus = $_POST['variant_sku'] ?? [];
-    if (!is_array($sizes) || !is_array($stocks) || !is_array($skus)) {
-        throw new RuntimeException('Las variantes no son válidas.');
-    }
-
     $variants = [];
-    foreach ($sizes as $index => $rawSize) {
+    foreach (is_array($sizes) ? $sizes : [] as $index => $rawSize) {
         $size = trim((string) $rawSize);
         $stock = filter_var($stocks[$index] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
         $sku = strtoupper(trim((string) ($skus[$index] ?? '')));
@@ -268,27 +352,33 @@ function saveProduct(PDO $pdo, string $basePath): int
     $pdo->beginTransaction();
     try {
         if ($productId !== false) {
-            $statement = $pdo->prepare('UPDATE products SET sku = ?, name = ?, description = ?, category = ?, type = ?, brand = ?, color = ?, gender = ?, aliases = ?, unit = ?, price = ?, sale_price = ?, stock = ?, image_url = ?, active = ? WHERE id = ?');
-            $statement->execute([$primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active, $productId]);
+            $statement = $pdo->prepare('SELECT store_id FROM products WHERE id = ? FOR UPDATE');
+            $statement->execute([(int) $productId]);
+            $existingStore = $statement->fetchColumn();
+            if ($existingStore === false) {
+                throw new RuntimeException('Producto no encontrado.');
+            }
+            assertStoreAccess($pdo, $user, (int) $existingStore);
+            $statement = $pdo->prepare('UPDATE products SET store_id = ?, sku = ?, name = ?, description = ?, category = ?, type = ?, brand = ?, color = ?, gender = ?, aliases = ?, unit = ?, price = ?, sale_price = ?, stock = ?, image_url = ?, active = ? WHERE id = ?');
+            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active, (int) $productId]);
             $savedId = (int) $productId;
             $pdo->prepare('DELETE FROM product_variants WHERE product_id = ?')->execute([$savedId]);
         } else {
-            $statement = $pdo->prepare('INSERT INTO products (sku, name, description, category, type, brand, color, gender, aliases, unit, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-            $statement->execute([$primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active]);
+            $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active]);
             $savedId = (int) $pdo->lastInsertId();
         }
-
         $variantStatement = $pdo->prepare('INSERT INTO product_variants (product_id, sku, size, stock, active) VALUES (?, ?, ?, ?, ?)');
         foreach ($variants as $variant) {
             $variantStatement->execute([$savedId, $variant['sku'], $variant['size'], $variant['stock'], $active]);
         }
-
         if ($imageUrl !== '') {
             $pdo->prepare('UPDATE product_images SET is_primary = FALSE WHERE product_id = ?')->execute([$savedId]);
-            $imageStatement = $pdo->prepare('INSERT INTO product_images (product_id, image_path, image_url, is_primary) VALUES (?, ?, ?, TRUE)');
-            $imageStatement->execute([$savedId, str_starts_with($imageUrl, 'uploads/') ? $imageUrl : null, $imageUrl]);
+            $pdo->prepare('INSERT INTO product_images (product_id, image_path, image_url, is_primary) VALUES (?, ?, ?, TRUE)')
+                ->execute([$savedId, str_starts_with($imageUrl, 'uploads/') ? $imageUrl : null, $imageUrl]);
         }
-
+        $pdo->prepare('INSERT INTO order_events (order_id, event_type, actor, details) SELECT id, ?, ?, ? FROM orders WHERE 1=0')
+            ->execute(['CATALOG_UPDATED', (string) $user['email'], '{}']);
         $pdo->commit();
         return $savedId;
     } catch (Throwable $error) {
@@ -299,260 +389,495 @@ function saveProduct(PDO $pdo, string $basePath): int
     }
 }
 
-$view = (string) ($_GET['view'] ?? $_POST['view'] ?? 'orders');
-if (!in_array($view, VIEWS, true)) {
-    $view = 'orders';
+function saveLocation(PDO $pdo): void
+{
+    $kind = (string) ($_POST['location_kind'] ?? '');
+    if ($kind === 'city') {
+        $name = trim((string) ($_POST['city_name'] ?? ''));
+        if ($name === '') {
+            throw new RuntimeException('Nombre de ciudad obligatorio.');
+        }
+        $pdo->prepare('INSERT INTO cities (name, active) VALUES (?, TRUE) ON DUPLICATE KEY UPDATE active = TRUE')->execute([$name]);
+        return;
+    }
+    if ($kind === 'zone') {
+        $cityId = filter_var($_POST['city_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $name = trim((string) ($_POST['zone_name'] ?? ''));
+        if ($cityId === false || $name === '') {
+            throw new RuntimeException('Ciudad y zona son obligatorias.');
+        }
+        $pdo->prepare('INSERT INTO zones (city_id, name, active) VALUES (?, ?, TRUE) ON DUPLICATE KEY UPDATE active = TRUE')->execute([$cityId, $name]);
+        return;
+    }
+    if ($kind === 'store') {
+        $cityId = filter_var($_POST['city_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $zoneId = filter_var($_POST['zone_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $name = trim((string) ($_POST['store_name'] ?? ''));
+        $address = trim((string) ($_POST['store_address'] ?? ''));
+        $phone = trim((string) ($_POST['store_phone'] ?? ''));
+        if ($cityId === false || $name === '') {
+            throw new RuntimeException('Ciudad y tienda son obligatorias.');
+        }
+        $pdo->prepare('INSERT INTO stores (city_id, zone_id, name, address, phone, active) VALUES (?, ?, ?, ?, ?, TRUE) ON DUPLICATE KEY UPDATE zone_id = VALUES(zone_id), address = VALUES(address), phone = VALUES(phone), active = TRUE')
+            ->execute([$cityId, $zoneId === false ? null : $zoneId, $name, $address ?: null, $phone ?: null]);
+        return;
+    }
+    throw new RuntimeException('Ubicación no válida.');
 }
 
+function saveUser(PDO $pdo): int
+{
+    $userId = filter_var($_POST['user_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $name = trim((string) ($_POST['name'] ?? ''));
+    $email = strtolower(trim((string) ($_POST['email'] ?? '')));
+    $role = strtoupper(trim((string) ($_POST['role'] ?? '')));
+    $password = (string) ($_POST['password'] ?? '');
+    $active = isset($_POST['active']) ? 1 : 0;
+    if ($name === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || !in_array($role, ROLES, true)) {
+        throw new RuntimeException('Nombre, email y rol son obligatorios.');
+    }
+
+    $pdo->beginTransaction();
+    try {
+        if ($userId !== false) {
+            if ($password !== '') {
+                $statement = $pdo->prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ?, password_hash = ? WHERE id = ?');
+                $statement->execute([$name, $email, $role, $active, password_hash($password, PASSWORD_DEFAULT), (int) $userId]);
+            } else {
+                $statement = $pdo->prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ? WHERE id = ?');
+                $statement->execute([$name, $email, $role, $active, (int) $userId]);
+            }
+            $savedId = (int) $userId;
+            $pdo->prepare('DELETE FROM user_store_assignments WHERE user_id = ?')->execute([$savedId]);
+            $pdo->prepare('DELETE FROM user_city_assignments WHERE user_id = ?')->execute([$savedId]);
+        } else {
+            if ($password === '') {
+                throw new RuntimeException('La contraseña es obligatoria para usuarios nuevos.');
+            }
+            $statement = $pdo->prepare('INSERT INTO users (name, email, password_hash, role, active) VALUES (?, ?, ?, ?, ?)');
+            $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT), $role, $active]);
+            $savedId = (int) $pdo->lastInsertId();
+        }
+
+        $cityStatement = $pdo->prepare('INSERT IGNORE INTO user_city_assignments (user_id, city_id) VALUES (?, ?)');
+        foreach (normalizeIds($_POST['assigned_city_ids'] ?? []) as $cityId) {
+            $cityStatement->execute([$savedId, $cityId]);
+        }
+        $storeStatement = $pdo->prepare('INSERT IGNORE INTO user_store_assignments (user_id, store_id) VALUES (?, ?)');
+        foreach (normalizeIds($_POST['assigned_store_ids'] ?? []) as $storeId) {
+            $storeStatement->execute([$savedId, $storeId]);
+        }
+        $pdo->commit();
+        return $savedId;
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+}
+
+function assertOrderAccess(PDO $pdo, array $user, int $orderId): void
+{
+    if ($user['role'] === 'ADMIN') {
+        return;
+    }
+    $statement = $pdo->prepare('SELECT store_id FROM orders WHERE id = ?');
+    $statement->execute([$orderId]);
+    $storeId = $statement->fetchColumn();
+    if ($storeId === false || $storeId === null || !in_array((int) $storeId, assignedStoreIds($pdo, $user), true)) {
+        throw new RuntimeException('No tienes acceso a ese pedido.');
+    }
+}
+
+$pdo = null;
+$databaseError = null;
+try {
+    $pdo = database();
+    ensureBootstrapAdmin($pdo);
+} catch (Throwable $error) {
+    $databaseError = $error->getMessage();
+}
+
+$view = (string) ($_GET['view'] ?? $_POST['view'] ?? 'orders');
 $selectedStatus = strtoupper((string) ($_GET['status'] ?? $_POST['return_status'] ?? 'ALL'));
 if (!in_array($selectedStatus, ORDER_STATUSES, true)) {
     $selectedStatus = 'ALL';
 }
 
-$operator = trim((string) ($_SERVER['HTTP_X_OPERATOR_USER'] ?? 'operador'));
-if ($operator === '') {
-    $operator = 'operador';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login' && $pdo instanceof PDO) {
+    $csrf = (string) ($_POST['csrf'] ?? '');
+    if (!hash_equals((string) $_SESSION['csrf'], $csrf)) {
+        redirectWithFlash($basePath, 'La sesión expiró. Vuelve a intentarlo.', 'error', 'login');
+    }
+    $email = strtolower(trim((string) ($_POST['email'] ?? '')));
+    $password = (string) ($_POST['password'] ?? '');
+    $statement = $pdo->prepare('SELECT * FROM users WHERE email = ? AND active = TRUE');
+    $statement->execute([$email]);
+    $loginUser = $statement->fetch();
+    if (is_array($loginUser) && password_verify($password, (string) $loginUser['password_hash'])) {
+        session_regenerate_id(true);
+        $_SESSION['user_id'] = (int) $loginUser['id'];
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+        $pdo->prepare('UPDATE users SET last_login_at = NOW() WHERE id = ?')->execute([(int) $loginUser['id']]);
+        redirectWithFlash($basePath, 'Sesión iniciada.', 'success');
+    }
+    redirectWithFlash($basePath, 'Credenciales no válidas.', 'error', 'login');
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if (($_GET['logout'] ?? '') === '1') {
+    session_destroy();
+    header('Location: ' . $basePath, true, 303);
+    exit;
+}
+
+$user = $pdo instanceof PDO ? currentUser($pdo) : null;
+$allowedViews = $user === null ? ['login'] : [];
+if ($user !== null && can($user, 'orders.view')) {
+    $allowedViews[] = 'orders';
+}
+if ($user !== null && can($user, 'catalog.write')) {
+    $allowedViews[] = 'catalog';
+}
+if ($user !== null && can($user, 'shipments.view')) {
+    $allowedViews[] = 'shipments';
+}
+if ($user !== null && can($user, 'stats.view')) {
+    $allowedViews[] = 'stats';
+}
+if ($user !== null && can($user, 'locations.manage')) {
+    $allowedViews[] = 'locations';
+}
+if ($user !== null && can($user, 'users.manage')) {
+    $allowedViews[] = 'users';
+}
+if ($user === null) {
+    $view = 'login';
+} elseif (!in_array($view, $allowedViews, true)) {
+    $view = $allowedViews[0];
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof PDO) {
     $csrf = (string) ($_POST['csrf'] ?? '');
     if (!hash_equals((string) $_SESSION['csrf'], $csrf)) {
         redirectWithFlash($basePath, 'La sesión expiró. Vuelve a intentarlo.', 'error', $view);
     }
-
     $action = (string) ($_POST['action'] ?? '');
-    $pdo = database();
-
     try {
         if ($action === 'save_product') {
-            $savedId = saveProduct($pdo, $basePath);
+            $savedId = saveProduct($pdo, $user);
             redirectWithFlash($basePath, "Producto #{$savedId} guardado.", 'success', 'catalog', ['edit' => $savedId]);
         }
-
         if ($action === 'toggle_product') {
+            if (!can($user, 'catalog.write')) {
+                throw new RuntimeException('No tienes permiso para modificar catálogo.');
+            }
             $productId = filter_var($_POST['product_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
             if ($productId === false) {
                 throw new RuntimeException('Producto no válido.');
             }
-            $pdo->prepare('UPDATE products SET active = NOT active WHERE id = ?')->execute([$productId]);
-            $pdo->prepare('UPDATE product_variants SET active = (SELECT active FROM products WHERE products.id = product_variants.product_id) WHERE product_id = ?')->execute([$productId]);
+            $statement = $pdo->prepare('SELECT store_id FROM products WHERE id = ?');
+            $statement->execute([(int) $productId]);
+            $storeId = $statement->fetchColumn();
+            if ($storeId === false) {
+                throw new RuntimeException('Producto no encontrado.');
+            }
+            assertStoreAccess($pdo, $user, (int) $storeId);
+            $pdo->prepare('UPDATE products SET active = NOT active WHERE id = ?')->execute([(int) $productId]);
+            $pdo->prepare('UPDATE product_variants SET active = (SELECT active FROM products WHERE products.id = product_variants.product_id) WHERE product_id = ?')->execute([(int) $productId]);
             redirectWithFlash($basePath, "Producto #{$productId} actualizado.", 'success', 'catalog');
+        }
+        if ($action === 'save_location') {
+            if (!can($user, 'locations.manage')) {
+                throw new RuntimeException('No tienes permiso para administrar ubicaciones.');
+            }
+            saveLocation($pdo);
+            redirectWithFlash($basePath, 'Ubicación guardada.', 'success', 'locations');
+        }
+        if ($action === 'save_user') {
+            if (!can($user, 'users.manage')) {
+                throw new RuntimeException('No tienes permiso para administrar usuarios.');
+            }
+            $savedId = saveUser($pdo);
+            redirectWithFlash($basePath, "Usuario #{$savedId} guardado.", 'success', 'users');
         }
 
         $orderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
         if ($orderId === false || !in_array($action, ['approve', 'reject', 'dispatch'], true)) {
             throw new RuntimeException('Acción no válida.');
         }
+        if (!can($user, 'orders.approve')) {
+            throw new RuntimeException('No tienes permiso para gestionar pedidos.');
+        }
+        assertOrderAccess($pdo, $user, (int) $orderId);
 
         if ($action === 'approve') {
             $statement = $pdo->prepare('CALL approve_order(?, ?)');
-            $statement->execute([$orderId, $operator]);
+            $statement->execute([(int) $orderId, (string) $user['email']]);
             $row = $statement->fetch();
             while ($statement->nextRowset()) {
-                // Consume every result set returned by MariaDB procedures.
             }
             $result = json_decode((string) ($row['result'] ?? ''), true, 512, JSON_THROW_ON_ERROR);
             if (($result['ok'] ?? false) !== true) {
                 throw new RuntimeException((string) ($result['error'] ?? 'No se pudo aprobar el pedido'));
             }
+            $pdo->prepare('UPDATE orders SET payment_reviewed_by_user_id = ? WHERE id = ?')->execute([(int) $user['id'], (int) $orderId]);
             redirectWithFlash($basePath, "Pedido #{$orderId} confirmado y stock descontado.", 'success', 'orders', ['status' => $selectedStatus]);
         }
 
         $pdo->beginTransaction();
-        $currentStatus = lockOrderStatus($pdo, $orderId);
-
+        $statement = $pdo->prepare('SELECT status FROM orders WHERE id = ? FOR UPDATE');
+        $statement->execute([(int) $orderId]);
+        $currentStatus = $statement->fetchColumn();
+        if (!is_string($currentStatus)) {
+            throw new RuntimeException('Pedido no encontrado.');
+        }
         if ($action === 'reject') {
             if ($currentStatus !== 'PENDING_PAYMENT') {
                 throw new RuntimeException("Solo se puede rechazar un pedido con pago pendiente; ahora está {$currentStatus}");
             }
-            $statement = $pdo->prepare("UPDATE orders SET status = 'REJECTED' WHERE id = ?");
-            $statement->execute([$orderId]);
+            $pdo->prepare("UPDATE orders SET status = 'REJECTED', payment_reviewed_by_user_id = ? WHERE id = ?")->execute([(int) $user['id'], (int) $orderId]);
             $eventType = 'PAYMENT_REJECTED';
             $message = "Pedido #{$orderId} rechazado.";
         } else {
             if ($currentStatus !== 'CONFIRMED') {
                 throw new RuntimeException("Solo se puede despachar un pedido confirmado; ahora está {$currentStatus}");
             }
-            $statement = $pdo->prepare("UPDATE orders SET status = 'DISPATCHED', logistics_notified_at = NOW() WHERE id = ?");
-            $statement->execute([$orderId]);
+            $pdo->prepare("UPDATE orders SET status = 'DISPATCHED', logistics_notified_at = NOW(), dispatched_by_user_id = ? WHERE id = ?")->execute([(int) $user['id'], (int) $orderId]);
             $eventType = 'ORDER_DISPATCHED';
             $message = "Pedido #{$orderId} marcado como despachado.";
         }
-
-        $event = $pdo->prepare('INSERT INTO order_events (order_id, event_type, actor, details) VALUES (?, ?, ?, ?)');
-        $event->execute([$orderId, $eventType, $operator, json_encode(['source' => 'operator-panel'], JSON_THROW_ON_ERROR)]);
+        $pdo->prepare('INSERT INTO order_events (order_id, event_type, actor, details) VALUES (?, ?, ?, ?)')
+            ->execute([(int) $orderId, $eventType, (string) $user['email'], json_encode(['source' => 'sales-backoffice'], JSON_THROW_ON_ERROR)]);
         $pdo->commit();
         redirectWithFlash($basePath, $message, 'success', 'orders', ['status' => $selectedStatus]);
     } catch (Throwable $error) {
-        if (isset($pdo) && $pdo->inTransaction()) {
+        if ($pdo->inTransaction()) {
             $pdo->rollBack();
         }
         redirectWithFlash($basePath, $error->getMessage(), 'error', $view);
     }
 }
 
-try {
-    $pdo = database();
-    $counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
-    foreach ($pdo->query('SELECT status, COUNT(*) AS total FROM orders GROUP BY status') as $row) {
-        $counts[$row['status']] = (int) $row['total'];
+$counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
+$orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = [];
+$visibleStores = [];
+$editProduct = null;
+$editVariants = [];
+$editUser = null;
+$editUserCityIds = $editUserStoreIds = [];
+
+if ($pdo instanceof PDO && $user !== null) {
+    $cities = $pdo->query('SELECT * FROM cities ORDER BY name')->fetchAll();
+    $zones = $pdo->query('SELECT z.*, c.name AS city_name FROM zones z JOIN cities c ON c.id = z.city_id ORDER BY c.name, z.name')->fetchAll();
+    $stores = $pdo->query('SELECT s.*, c.name AS city_name, z.name AS zone_name FROM stores s JOIN cities c ON c.id = s.city_id LEFT JOIN zones z ON z.id = s.zone_id ORDER BY c.name, z.name, s.name')->fetchAll();
+    $visibleStores = $stores;
+    if ($user['role'] !== 'ADMIN') {
+        $storeIds = assignedStoreIds($pdo, $user);
+        $visibleStores = array_values(array_filter($stores, fn ($store) => in_array((int) $store['id'], $storeIds, true)));
     }
 
-    $sql = 'SELECT id, customer_name, phone, delivery_address, delivery_notes, raw_message, status, total, payment_proof_url, payment_confirmed_by, payment_confirmed_at, created_at, updated_at FROM orders';
-    $parameters = [];
-    if ($selectedStatus !== 'ALL') {
-        $sql .= ' WHERE status = ?';
-        $parameters[] = $selectedStatus;
+    if (can($user, 'orders.view')) {
+        $params = [];
+        $where = [scopedWhere($pdo, $user, 'o', $params)];
+        if ($selectedStatus !== 'ALL') {
+            $where[] = 'o.status = ?';
+            $params[] = $selectedStatus;
+        }
+        $countParams = [];
+        $countWhere = scopedWhere($pdo, $user, 'o', $countParams);
+        $countSql = "SELECT o.status, COUNT(*) AS total FROM orders o WHERE {$countWhere} GROUP BY o.status";
+        $statement = $pdo->prepare($countSql);
+        $statement->execute($countParams);
+        foreach ($statement->fetchAll() as $row) {
+            $counts[$row['status']] = (int) $row['total'];
+        }
+        $sql = 'SELECT o.*, s.name AS store_name, c.name AS city_name, z.name AS zone_name, u.name AS reviewer_name
+                FROM orders o
+                LEFT JOIN stores s ON s.id = o.store_id
+                LEFT JOIN cities c ON c.id = o.city_id
+                LEFT JOIN zones z ON z.id = o.zone_id
+                LEFT JOIN users u ON u.id = o.payment_reviewed_by_user_id
+                WHERE ' . implode(' AND ', $where) . '
+                ORDER BY o.created_at DESC, o.id DESC LIMIT 200';
+        $statement = $pdo->prepare($sql);
+        $statement->execute($params);
+        $orders = $statement->fetchAll();
+        $itemsStatement = $pdo->prepare('SELECT sku, product_name, size, quantity, unit_price, image_url FROM order_items WHERE order_id = ? ORDER BY id');
+        foreach ($orders as &$order) {
+            $itemsStatement->execute([(int) $order['id']]);
+            $order['items'] = $itemsStatement->fetchAll();
+        }
+        unset($order);
     }
-    $sql .= ' ORDER BY created_at DESC, id DESC LIMIT 200';
 
-    $statement = $pdo->prepare($sql);
-    $statement->execute($parameters);
-    $orders = $statement->fetchAll();
-
-    $itemsStatement = $pdo->prepare('SELECT sku, product_name, size, quantity, unit_price, image_url FROM order_items WHERE order_id = ? ORDER BY id');
-    foreach ($orders as &$order) {
-        $itemsStatement->execute([$order['id']]);
-        $order['items'] = $itemsStatement->fetchAll();
-    }
-    unset($order);
-
-    $products = $pdo->query(
-        "SELECT p.*, COALESCE(v.total_variant_stock, p.stock) AS total_variant_stock, v.variant_summary
-         FROM products p
-         LEFT JOIN (
-           SELECT product_id,
-             SUM(stock) AS total_variant_stock,
-             GROUP_CONCAT(CONCAT(size, ': ', stock) ORDER BY id SEPARATOR ', ') AS variant_summary
-           FROM product_variants
-           GROUP BY product_id
-         ) v ON v.product_id = p.id
-         ORDER BY p.updated_at DESC, p.id DESC"
-    )->fetchAll();
-
-    $editProduct = null;
-    $editVariants = [];
-    $editId = filter_var($_GET['edit'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-    if ($editId !== false && $editId !== null) {
-        $statement = $pdo->prepare('SELECT * FROM products WHERE id = ?');
-        $statement->execute([$editId]);
-        $editProduct = $statement->fetch() ?: null;
-        if ($editProduct !== null) {
-            $statement = $pdo->prepare('SELECT * FROM product_variants WHERE product_id = ? ORDER BY id');
-            $statement->execute([$editId]);
-            $editVariants = $statement->fetchAll();
+    if (can($user, 'catalog.write')) {
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'p', $params);
+        $statement = $pdo->prepare(
+            "SELECT p.*, s.name AS store_name, c.name AS city_name, COALESCE(v.total_variant_stock, p.stock) AS total_variant_stock, v.variant_summary
+             FROM products p
+             LEFT JOIN stores s ON s.id = p.store_id
+             LEFT JOIN cities c ON c.id = s.city_id
+             LEFT JOIN (
+               SELECT product_id, SUM(stock) AS total_variant_stock, GROUP_CONCAT(CONCAT(size, ': ', stock) ORDER BY id SEPARATOR ', ') AS variant_summary
+               FROM product_variants GROUP BY product_id
+             ) v ON v.product_id = p.id
+             WHERE {$where}
+             ORDER BY p.updated_at DESC, p.id DESC"
+        );
+        $statement->execute($params);
+        $products = $statement->fetchAll();
+        $editId = filter_var($_GET['edit'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($editId !== false && $editId !== null) {
+            $params = [(int) $editId];
+            $scope = scopedWhere($pdo, $user, 'p', $params);
+            $statement = $pdo->prepare("SELECT * FROM products p WHERE p.id = ? AND {$scope}");
+            $statement->execute($params);
+            $editProduct = $statement->fetch() ?: null;
+            if ($editProduct !== null) {
+                $statement = $pdo->prepare('SELECT * FROM product_variants WHERE product_id = ? ORDER BY id');
+                $statement->execute([(int) $editId]);
+                $editVariants = $statement->fetchAll();
+            }
         }
     }
 
-    $shipments = $pdo->query('SELECT * FROM daily_confirmed_orders ORDER BY payment_confirmed_at DESC, order_id DESC LIMIT 200')->fetchAll();
-} catch (Throwable $error) {
-    http_response_code(503);
-    $databaseError = $error->getMessage();
-    $counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
-    $orders = [];
-    $products = [];
-    $shipments = [];
-    $editProduct = null;
-    $editVariants = [];
+    if (can($user, 'shipments.view')) {
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'o', $params);
+        $statement = $pdo->prepare(
+            "SELECT o.id AS order_id, o.customer_name, o.phone, o.delivery_address, o.delivery_notes, o.total, o.payment_confirmed_at, s.name AS store_name,
+              GROUP_CONCAT(CONCAT(oi.quantity, ' x ', oi.product_name, IF(oi.size IS NULL OR oi.size = '', '', CONCAT(' talla ', oi.size))) ORDER BY oi.id SEPARATOR '\n') AS items
+             FROM orders o
+             JOIN order_items oi ON oi.order_id = o.id
+             LEFT JOIN stores s ON s.id = o.store_id
+             WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}
+             GROUP BY o.id, o.customer_name, o.phone, o.delivery_address, o.delivery_notes, o.total, o.payment_confirmed_at, s.name
+             ORDER BY o.payment_confirmed_at DESC, o.id DESC LIMIT 200"
+        );
+        $statement->execute($params);
+        $shipments = $statement->fetchAll();
+    }
+
+    if (can($user, 'stats.view')) {
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'o', $params);
+        $statement = $pdo->prepare(
+            "SELECT COUNT(*) AS orders_count, COALESCE(SUM(o.total), 0) AS sales_total, COALESCE(AVG(o.total), 0) AS average_ticket
+             FROM orders o WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}"
+        );
+        $statement->execute($params);
+        $stats['summary'] = $statement->fetch() ?: ['orders_count' => 0, 'sales_total' => 0, 'average_ticket' => 0];
+        $statement = $pdo->prepare(
+            "SELECT s.name AS store_name, COUNT(*) AS orders_count, COALESCE(SUM(o.total), 0) AS sales_total
+             FROM orders o LEFT JOIN stores s ON s.id = o.store_id
+             WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}
+             GROUP BY s.name ORDER BY sales_total DESC LIMIT 20"
+        );
+        $statement->execute($params);
+        $stats['stores'] = $statement->fetchAll();
+    }
+
+    if (can($user, 'users.manage')) {
+        $users = $pdo->query('SELECT * FROM users ORDER BY active DESC, role, name')->fetchAll();
+        $editUserId = filter_var($_GET['edit_user'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($editUserId !== false && $editUserId !== null) {
+            $statement = $pdo->prepare('SELECT * FROM users WHERE id = ?');
+            $statement->execute([(int) $editUserId]);
+            $editUser = $statement->fetch() ?: null;
+            if ($editUser !== null) {
+                $statement = $pdo->prepare('SELECT city_id FROM user_city_assignments WHERE user_id = ?');
+                $statement->execute([(int) $editUserId]);
+                $editUserCityIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+                $statement = $pdo->prepare('SELECT store_id FROM user_store_assignments WHERE user_id = ?');
+                $statement->execute([(int) $editUserId]);
+                $editUserStoreIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+            }
+        }
+    }
 }
 
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
 $totalOrders = array_sum($counts);
-$formProduct = $editProduct ?? [
-    'id' => '',
-    'name' => '',
-    'description' => '',
-    'category' => '',
-    'type' => '',
-    'brand' => '',
-    'color' => '',
-    'gender' => '',
-    'price' => '',
-    'sale_price' => '',
-    'image_url' => '',
-    'aliases' => '[]',
-    'active' => 1,
-];
+$formProduct = $editProduct ?? ['id' => '', 'store_id' => $visibleStores[0]['id'] ?? '', 'name' => '', 'description' => '', 'category' => '', 'type' => '', 'brand' => '', 'color' => '', 'gender' => '', 'price' => '', 'sale_price' => '', 'image_url' => '', 'aliases' => '[]', 'active' => 1];
 if ($editVariants === []) {
     $editVariants = [['sku' => '', 'size' => '', 'stock' => 0]];
 }
-$aliasesText = '';
-if (isset($formProduct['aliases'])) {
-    $decodedAliases = json_decode((string) $formProduct['aliases'], true);
-    $aliasesText = is_array($decodedAliases) ? implode("\n", $decodedAliases) : '';
-}
+$decodedAliases = json_decode((string) ($formProduct['aliases'] ?? '[]'), true);
+$aliasesText = is_array($decodedAliases) ? implode("\n", $decodedAliases) : '';
+$formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'PROVIDER', 'active' => 1];
 ?>
 <!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ventas WhatsApp · Operador</title>
+  <title>Ventas WhatsApp</title>
   <style>
-    :root { color-scheme: light; --ink:#18221d; --muted:#65716a; --paper:#f4f2eb; --panel:#fff; --line:#dcded7; --green:#1c6b4a; --green-soft:#dceee5; --amber:#966114; --amber-soft:#fff0cf; --red:#a13832; --red-soft:#f9dfdc; --blue:#315f8a; --blue-soft:#e1edf8; --dark:#13251d; }
+    :root { color-scheme:light; --ink:#18221d; --muted:#65716a; --paper:#f4f2eb; --panel:#fff; --line:#dcded7; --green:#1c6b4a; --green-soft:#dceee5; --amber:#966114; --amber-soft:#fff0cf; --red:#a13832; --red-soft:#f9dfdc; --blue:#315f8a; --blue-soft:#e1edf8; --dark:#13251d; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--paper); color:var(--ink); font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     header { background:var(--dark); color:#fff; padding:24px clamp(18px,4vw,54px); }
-    header .wrap { max-width:1440px; margin:auto; display:flex; justify-content:space-between; gap:24px; align-items:end; }
+    header .wrap, main { max-width:1440px; margin:auto; }
+    header .wrap { display:flex; justify-content:space-between; gap:24px; align-items:end; }
+    main { padding:24px clamp(18px,4vw,54px) 60px; }
     h1 { margin:0 0 4px; font-size:clamp(25px,4vw,38px); }
     h2 { margin:0 0 14px; font-size:22px; }
     h3 { margin:0 0 10px; font-size:17px; }
-    p { margin:0; }
-    header p { color:#b9c8c0; }
+    p { margin:0; } header p { color:#b9c8c0; }
     a { color:var(--green); }
-    main { max-width:1440px; margin:auto; padding:24px clamp(18px,4vw,54px) 60px; }
-    .tabs, .filters, .actions { display:flex; flex-wrap:wrap; gap:8px; }
+    .tabs,.filters,.actions { display:flex; flex-wrap:wrap; gap:8px; }
     .tabs { margin-bottom:18px; }
-    .tab, .filters a { color:var(--ink); background:#e8e6de; padding:9px 13px; border-radius:8px; text-decoration:none; font-size:14px; font-weight:700; }
-    .tab.active, .filters a.active { background:var(--dark); color:#fff; }
-    .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:12px; margin-bottom:18px; }
-    .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; text-decoration:none; color:inherit; }
+    .tab,.filters a { color:var(--ink); background:#e8e6de; padding:9px 13px; border-radius:8px; text-decoration:none; font-size:14px; font-weight:800; }
+    .tab.active,.filters a.active { background:var(--dark); color:#fff; }
+    .summary,.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:18px; }
+    .metric,.panel,.order,.product { background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 4px 18px rgb(30 42 35 / 5%); }
+    .metric { padding:16px; text-decoration:none; color:inherit; }
     .metric strong { display:block; font-size:27px; margin-top:4px; }
-    .metric.active { outline:3px solid #8bbda5; border-color:transparent; }
-    .flash, .error-box { padding:13px 16px; border-radius:8px; margin-bottom:18px; border:1px solid; }
+    .panel { padding:18px; overflow:hidden; }
+    .flash,.error-box { padding:13px 16px; border-radius:8px; margin-bottom:18px; border:1px solid; }
     .flash.success { background:var(--green-soft); border-color:#9bcab3; color:#174d37; }
-    .flash.error, .error-box { background:var(--red-soft); border-color:#dda7a2; color:#742621; }
+    .flash.error,.error-box { background:var(--red-soft); border-color:#dda7a2; color:#742621; }
     .grid { display:grid; gap:16px; }
-    .split { display:grid; grid-template-columns:minmax(320px,.8fr) minmax(360px,1.2fr); gap:18px; align-items:start; }
-    .panel, .order, .product { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 4px 18px rgb(30 42 35 / 5%); }
-    .panel { padding:18px; }
-    .order-head, .product-head { padding:16px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:14px; }
-    .order-title, .product-title { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .order-title h2, .product-title h2 { font-size:18px; margin:0; }
+    .split { display:grid; grid-template-columns:minmax(320px,.8fr) minmax(380px,1.2fr); gap:18px; align-items:start; }
+    .head { padding:16px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:14px; }
+    .title { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .title h2 { font-size:18px; margin:0; }
     .badge { border-radius:999px; padding:5px 9px; font-size:12px; font-weight:800; }
     .PENDING_PAYMENT { background:var(--amber-soft); color:var(--amber); }
-    .CONFIRMED, .active-badge { background:var(--green-soft); color:var(--green); }
+    .CONFIRMED,.active-badge { background:var(--green-soft); color:var(--green); }
     .REJECTED,.CANCELLED,.inactive-badge { background:var(--red-soft); color:var(--red); }
     .DISPATCHED { background:var(--blue-soft); color:var(--blue); }
-    .total, .price { font-size:20px; font-weight:800; white-space:nowrap; }
-    .order-body, .product-body { display:grid; grid-template-columns:minmax(220px,.9fr) minmax(280px,1.5fr); gap:18px; padding:18px; }
+    .body { display:grid; grid-template-columns:minmax(220px,.9fr) minmax(280px,1.5fr); gap:18px; padding:18px; }
     .facts { display:grid; gap:10px; font-size:14px; }
-    .fact span, label span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; font-weight:800; }
+    .fact span,label span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; font-weight:800; }
     .items { display:grid; gap:8px; }
     .item { display:grid; grid-template-columns:52px 1fr auto; gap:11px; align-items:center; background:#f7f7f3; border-radius:8px; padding:8px; }
-    .item img, .thumb { width:52px; height:52px; border-radius:8px; object-fit:cover; background:#e6e7e1; }
+    .item img,.thumb { width:52px; height:52px; border-radius:8px; object-fit:cover; background:#e6e7e1; }
     .hero-img { width:100%; max-height:230px; object-fit:cover; border-radius:8px; background:#e6e7e1; }
-    .item small, .muted { color:var(--muted); }
+    .muted,.item small { color:var(--muted); }
     .actions { padding:0 18px 18px; }
     .actions form { margin:0; }
-    button, .button { border:0; border-radius:8px; padding:10px 14px; color:#fff; font-weight:800; cursor:pointer; text-decoration:none; display:inline-block; }
-    button.approve, .primary { background:var(--green); }
-    button.reject, .danger { background:var(--red); }
-    button.dispatch, .secondary { background:var(--blue); }
-    button.neutral { background:#5f6b64; }
-    input, textarea, select { width:100%; border:1px solid #cfd3ca; border-radius:8px; padding:10px 11px; font:inherit; background:#fff; color:var(--ink); }
+    button,.button { border:0; border-radius:8px; padding:10px 14px; color:#fff; font-weight:800; cursor:pointer; text-decoration:none; display:inline-block; }
+    .approve,.primary { background:var(--green); }
+    .reject,.danger { background:var(--red); }
+    .dispatch,.secondary { background:var(--blue); }
+    .neutral { background:#5f6b64; }
+    input,textarea,select { width:100%; border:1px solid #cfd3ca; border-radius:8px; padding:10px 11px; font:inherit; background:#fff; color:var(--ink); }
     input[type="checkbox"] { width:auto; margin-right:8px; }
     textarea { min-height:86px; resize:vertical; }
-    form.catalog { display:grid; gap:14px; }
+    form.catalog,form.stacked { display:grid; gap:14px; }
     .fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-    .fields .wide { grid-column:1/-1; }
+    .wide { grid-column:1/-1; }
     .variant-row { display:grid; grid-template-columns:1fr 1fr .8fr; gap:9px; margin-bottom:8px; }
     .empty { text-align:center; background:var(--panel); border:1px dashed #c5c8bf; border-radius:8px; padding:42px 20px; color:var(--muted); }
-    .shipments { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    .shipments th, .shipments td { text-align:left; padding:12px; border-bottom:1px solid var(--line); vertical-align:top; }
-    .shipments th { background:#eef0ea; font-size:12px; text-transform:uppercase; color:var(--muted); }
-    @media (max-width:860px) { header .wrap { align-items:start; flex-direction:column; } .split,.order-body,.product-body,.fields{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)} .variant-row{grid-template-columns:1fr} }
+    table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+    th,td { text-align:left; padding:12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { background:#eef0ea; font-size:12px; text-transform:uppercase; color:var(--muted); }
+    .login { max-width:420px; margin:40px auto; }
+    @media (max-width:860px) { header .wrap{align-items:start;flex-direction:column}.split,.body,.fields{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.variant-row{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -560,195 +885,117 @@ if (isset($formProduct['aliases'])) {
   <div class="wrap">
     <section>
       <h1>Ventas WhatsApp</h1>
-      <p>Catálogo, pagos y despacho</p>
+      <p>Catálogo, pagos, usuarios y despacho</p>
     </section>
-    <p>Operador<br><strong><?= escape($operator) ?></strong></p>
+    <?php if ($user): ?>
+      <p><?= escape($user['name']) ?><br><strong><?= escape(roleLabel((string) $user['role'])) ?></strong> · <a href="<?= escape($basePath) ?>?logout=1" style="color:#fff">Salir</a></p>
+    <?php endif; ?>
   </div>
 </header>
 <main>
-  <nav class="tabs" aria-label="Secciones">
-    <a class="tab <?= $view === 'orders' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders')) ?>">Pedidos</a>
-    <a class="tab <?= $view === 'catalog' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Catálogo</a>
-    <a class="tab <?= $view === 'shipments' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'shipments')) ?>">Envíos</a>
-  </nav>
+  <?php if ($flash): ?><div class="flash <?= escape($flash['type']) ?>"><?= escape($flash['message']) ?></div><?php endif; ?>
+  <?php if ($databaseError): ?><div class="error-box"><strong>No se pudo consultar MariaDB.</strong><br><?= escape($databaseError) ?></div><?php endif; ?>
 
-  <?php if ($flash): ?>
-    <div class="flash <?= escape($flash['type']) ?>" role="status"><?= escape($flash['message']) ?></div>
-  <?php endif; ?>
-  <?php if (isset($databaseError)): ?>
-    <div class="error-box"><strong>No se pudo consultar MariaDB.</strong><br><?= escape($databaseError) ?></div>
-  <?php elseif ($view === 'catalog'): ?>
-    <section class="split">
-      <form class="panel catalog" method="post" enctype="multipart/form-data" action="<?= escape($basePath) ?>">
-        <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
-        <input type="hidden" name="action" value="save_product">
-        <input type="hidden" name="view" value="catalog">
-        <input type="hidden" name="product_id" value="<?= escape((string) $formProduct['id']) ?>">
-        <h2><?= $editProduct ? 'Editar producto' : 'Crear producto' ?></h2>
-        <div class="fields">
-          <label class="wide"><span>Nombre</span><input name="name" required value="<?= escape((string) $formProduct['name']) ?>" placeholder="Zapato deportivo negro"></label>
-          <label><span>Categoría</span><input name="category" required value="<?= escape((string) $formProduct['category']) ?>" placeholder="zapatos"></label>
-          <label><span>Tipo o clase</span><input name="type" required value="<?= escape((string) $formProduct['type']) ?>" placeholder="deportivos"></label>
-          <label><span>Marca</span><input name="brand" value="<?= escape((string) $formProduct['brand']) ?>" placeholder="Nike"></label>
-          <label><span>Color</span><input name="color" value="<?= escape((string) $formProduct['color']) ?>" placeholder="negro"></label>
-          <label><span>Género</span><input name="gender" value="<?= escape((string) $formProduct['gender']) ?>" placeholder="unisex"></label>
-          <label><span>Precio</span><input name="price" required inputmode="decimal" value="<?= escape((string) $formProduct['price']) ?>" placeholder="145000"></label>
-          <label><span>Precio promo</span><input name="sale_price" inputmode="decimal" value="<?= escape((string) $formProduct['sale_price']) ?>" placeholder="opcional"></label>
-          <label class="wide"><span>Descripción</span><textarea name="description" placeholder="Detalle corto para vender mejor"><?= escape((string) $formProduct['description']) ?></textarea></label>
-          <label class="wide"><span>Aliases, uno por línea</span><textarea name="aliases" placeholder="tenis&#10;zapatos deportivos&#10;sneakers"><?= escape($aliasesText) ?></textarea></label>
-          <label class="wide"><span>Subir foto</span><input type="file" name="image" accept="image/jpeg,image/png,image/webp"></label>
-          <label class="wide"><span>URL de imagen</span><input name="image_url" value="<?= escape((string) $formProduct['image_url']) ?>" placeholder="opcional si no subes archivo"></label>
-          <label class="wide checkbox"><input type="checkbox" name="active" value="1" <?= (int) $formProduct['active'] === 1 ? 'checked' : '' ?>> Producto activo</label>
-        </div>
-        <section>
+  <?php if ($view === 'login'): ?>
+    <form class="panel login stacked" method="post" action="<?= escape($basePath) ?>">
+      <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+      <input type="hidden" name="action" value="login">
+      <h2>Entrar al backoffice</h2>
+      <label><span>Email</span><input name="email" type="email" required autocomplete="username"></label>
+      <label><span>Contraseña</span><input name="password" type="password" required autocomplete="current-password"></label>
+      <button class="primary" type="submit">Entrar</button>
+      <p class="muted">Si es la primera instalación, se crea un admin inicial con `OPERATOR_ADMIN_EMAIL` y `OPERATOR_ADMIN_PASSWORD`.</p>
+    </form>
+  <?php elseif ($user): ?>
+    <nav class="tabs">
+      <?php foreach ($allowedViews as $allowedView): if ($allowedView === 'login') continue; ?>
+        <a class="tab <?= $view === $allowedView ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, $allowedView)) ?>"><?= escape(match ($allowedView) { 'orders' => 'Pedidos', 'catalog' => 'Catálogo', 'shipments' => 'Envíos', 'stats' => 'Estadísticas', 'locations' => 'Ubicaciones', 'users' => 'Usuarios', default => $allowedView }) ?></a>
+      <?php endforeach; ?>
+    </nav>
+
+    <?php if ($view === 'catalog'): ?>
+      <section class="split">
+        <form class="panel catalog" method="post" enctype="multipart/form-data" action="<?= escape($basePath) ?>">
+          <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+          <input type="hidden" name="action" value="save_product">
+          <input type="hidden" name="view" value="catalog">
+          <input type="hidden" name="product_id" value="<?= escape((string) $formProduct['id']) ?>">
+          <h2><?= $editProduct ? 'Editar producto' : 'Crear producto' ?></h2>
+          <div class="fields">
+            <label class="wide"><span>Tienda</span><select name="store_id" required><?php foreach ($visibleStores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= (int) $formProduct['store_id'] === (int) $store['id'] ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select></label>
+            <label class="wide"><span>Nombre</span><input name="name" required value="<?= escape((string) $formProduct['name']) ?>"></label>
+            <label><span>Categoría</span><input name="category" required value="<?= escape((string) $formProduct['category']) ?>"></label>
+            <label><span>Tipo</span><input name="type" required value="<?= escape((string) $formProduct['type']) ?>"></label>
+            <label><span>Marca</span><input name="brand" value="<?= escape((string) $formProduct['brand']) ?>"></label>
+            <label><span>Color</span><input name="color" value="<?= escape((string) $formProduct['color']) ?>"></label>
+            <label><span>Género</span><input name="gender" value="<?= escape((string) $formProduct['gender']) ?>"></label>
+            <label><span>Precio</span><input name="price" required inputmode="decimal" value="<?= escape((string) $formProduct['price']) ?>"></label>
+            <label><span>Precio promo</span><input name="sale_price" inputmode="decimal" value="<?= escape((string) $formProduct['sale_price']) ?>"></label>
+            <label class="wide"><span>Descripción</span><textarea name="description"><?= escape((string) $formProduct['description']) ?></textarea></label>
+            <label class="wide"><span>Aliases, uno por línea</span><textarea name="aliases"><?= escape($aliasesText) ?></textarea></label>
+            <label class="wide"><span>Subir foto</span><input type="file" name="image" accept="image/jpeg,image/png,image/webp"></label>
+            <label class="wide"><span>URL de imagen</span><input name="image_url" value="<?= escape((string) $formProduct['image_url']) ?>"></label>
+            <label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formProduct['active'] === 1 ? 'checked' : '' ?>> Producto activo</label>
+          </div>
           <h3>Tallas y cantidades</h3>
           <?php for ($i = 0; $i < max(5, count($editVariants)); $i++): $variant = $editVariants[$i] ?? ['sku' => '', 'size' => '', 'stock' => '']; ?>
-            <div class="variant-row">
-              <input name="variant_size[]" value="<?= escape((string) $variant['size']) ?>" placeholder="Talla M">
-              <input name="variant_sku[]" value="<?= escape((string) $variant['sku']) ?>" placeholder="SKU opcional">
-              <input name="variant_stock[]" value="<?= escape((string) $variant['stock']) ?>" inputmode="numeric" placeholder="Cantidad">
-            </div>
+            <div class="variant-row"><input name="variant_size[]" value="<?= escape((string) $variant['size']) ?>" placeholder="Talla M"><input name="variant_sku[]" value="<?= escape((string) $variant['sku']) ?>" placeholder="SKU opcional"><input name="variant_stock[]" value="<?= escape((string) $variant['stock']) ?>" inputmode="numeric" placeholder="Cantidad"></div>
           <?php endfor; ?>
-        </section>
-        <div class="actions">
-          <button class="approve" type="submit">Guardar producto</button>
-          <?php if ($editProduct): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Nuevo</a><?php endif; ?>
-        </div>
-      </form>
-
-      <section class="grid">
-        <?php if ($products === []): ?>
-          <div class="empty">Todavía no hay productos en el catálogo.</div>
-        <?php else: ?>
+          <div class="actions"><button class="approve" type="submit">Guardar producto</button><?php if ($editProduct): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Nuevo</a><?php endif; ?></div>
+        </form>
+        <section class="grid">
           <?php foreach ($products as $product): ?>
             <article class="product">
-              <div class="product-head">
-                <div class="product-title">
-                  <h2><?= escape($product['name']) ?></h2>
-                  <span class="badge <?= (int) $product['active'] === 1 ? 'active-badge' : 'inactive-badge' ?>"><?= (int) $product['active'] === 1 ? 'Activo' : 'Inactivo' ?></span>
-                </div>
-                <div class="price">$<?= money($product['sale_price'] ?: $product['price']) ?></div>
-              </div>
-              <div class="product-body">
-                <div>
-                  <?php if ($product['image_url']): ?><img class="hero-img" src="<?= escape(imageSrc($basePath, $product['image_url'])) ?>" alt="" loading="lazy"><?php endif; ?>
-                </div>
-                <div class="facts">
-                  <div class="fact"><span>Categoría</span><?= escape($product['category']) ?> · <?= escape($product['type']) ?></div>
-                  <div class="fact"><span>Marca / color</span><?= escape(trim(($product['brand'] ?? '') . ' ' . ($product['color'] ?? '')) ?: 'Sin definir') ?></div>
-                  <div class="fact"><span>Stock</span><?= (int) $product['total_variant_stock'] ?> unidades · <?= escape($product['variant_summary'] ?? '') ?></div>
-                  <div class="fact"><span>Descripción</span><?= nl2br(escape($product['description'])) ?></div>
-                </div>
-              </div>
-              <div class="actions">
-                <a class="button secondary" href="<?= escape(viewUrl($basePath, 'catalog', ['edit' => (int) $product['id']])) ?>">Editar</a>
-                <form method="post" action="<?= escape($basePath) ?>">
-                  <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
-                  <input type="hidden" name="action" value="toggle_product">
-                  <input type="hidden" name="view" value="catalog">
-                  <input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>">
-                  <button class="<?= (int) $product['active'] === 1 ? 'reject' : 'approve' ?>" type="submit"><?= (int) $product['active'] === 1 ? 'Desactivar' : 'Activar' ?></button>
-                </form>
-              </div>
+              <div class="head"><div class="title"><h2><?= escape($product['name']) ?></h2><span class="badge <?= (int) $product['active'] === 1 ? 'active-badge' : 'inactive-badge' ?>"><?= (int) $product['active'] === 1 ? 'Activo' : 'Inactivo' ?></span></div><strong>$<?= money($product['sale_price'] ?: $product['price']) ?></strong></div>
+              <div class="body"><div><?php if ($product['image_url']): ?><img class="hero-img" src="<?= escape(imageSrc($basePath, $product['image_url'])) ?>" alt="" loading="lazy"><?php endif; ?></div><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($product['city_name'] ?? '') . ' · ' . ($product['store_name'] ?? '')) ?></div><div class="fact"><span>Categoría</span><?= escape($product['category']) ?> · <?= escape($product['type']) ?></div><div class="fact"><span>Stock</span><?= (int) $product['total_variant_stock'] ?> · <?= escape($product['variant_summary'] ?? '') ?></div><div class="fact"><span>Descripción</span><?= nl2br(escape($product['description'])) ?></div></div></div>
+              <div class="actions"><a class="button secondary" href="<?= escape(viewUrl($basePath, 'catalog', ['edit' => (int) $product['id']])) ?>">Editar</a><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="toggle_product"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><button class="<?= (int) $product['active'] === 1 ? 'reject' : 'approve' ?>" type="submit"><?= (int) $product['active'] === 1 ? 'Desactivar' : 'Activar' ?></button></form></div>
             </article>
           <?php endforeach; ?>
-        <?php endif; ?>
+          <?php if ($products === []): ?><div class="empty">No hay productos visibles para tu rol.</div><?php endif; ?>
+        </section>
       </section>
-    </section>
-  <?php elseif ($view === 'shipments'): ?>
-    <?php if ($shipments === []): ?>
-      <div class="empty">No hay envíos aprobados pendientes en la vista diaria.</div>
-    <?php else: ?>
-      <table class="shipments">
-        <thead><tr><th>Pedido</th><th>Cliente</th><th>Dirección</th><th>Productos</th><th>Total</th><th>Aprobado</th></tr></thead>
-        <tbody>
-          <?php foreach ($shipments as $shipment): ?>
-            <tr>
-              <td>#<?= (int) $shipment['order_id'] ?></td>
-              <td><?= escape($shipment['customer_name']) ?><br><span class="muted"><?= escape($shipment['phone']) ?></span></td>
-              <td><?= escape($shipment['delivery_address']) ?><?php if ($shipment['delivery_notes']): ?><br><span class="muted"><?= escape($shipment['delivery_notes']) ?></span><?php endif; ?></td>
-              <td><?= nl2br(escape($shipment['items'])) ?></td>
-              <td>$<?= money($shipment['total']) ?></td>
-              <td><?= escape($shipment['payment_confirmed_at']) ?></td>
-            </tr>
-          <?php endforeach; ?>
-        </tbody>
-      </table>
-    <?php endif; ?>
-  <?php else: ?>
-    <nav class="summary" aria-label="Resumen de pedidos">
-      <a class="metric <?= $selectedStatus === 'ALL' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders')) ?>"><span>Todos</span><strong><?= $totalOrders ?></strong></a>
-      <?php foreach ($counts as $status => $count): ?>
-        <a class="metric <?= $selectedStatus === $status ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders', ['status' => $status])) ?>"><span><?= escape(statusLabel($status)) ?></span><strong><?= $count ?></strong></a>
-      <?php endforeach; ?>
-    </nav>
-    <nav class="filters" aria-label="Filtros">
-      <?php foreach (ORDER_STATUSES as $status): ?>
-        <a class="<?= $selectedStatus === $status ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders', $status === 'ALL' ? [] : ['status' => $status])) ?>"><?= $status === 'ALL' ? 'Todos' : escape(statusLabel($status)) ?></a>
-      <?php endforeach; ?>
-    </nav>
-    <?php if ($orders === []): ?>
-      <div class="empty">No hay pedidos en este estado.</div>
-    <?php else: ?>
+    <?php elseif ($view === 'locations' && can($user, 'locations.manage')): ?>
+      <section class="split">
+        <div class="grid">
+          <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="city"><h2>Crear ciudad</h2><label><span>Nombre</span><input name="city_name" required></label><button class="primary" type="submit">Guardar ciudad</button></form>
+          <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="zone"><h2>Crear zona</h2><label><span>Ciudad</span><select name="city_id"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>"><?= escape($city['name']) ?></option><?php endforeach; ?></select></label><label><span>Zona</span><input name="zone_name" required></label><button class="primary" type="submit">Guardar zona</button></form>
+          <form class="panel stacked" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_location"><input type="hidden" name="view" value="locations"><input type="hidden" name="location_kind" value="store"><h2>Crear tienda</h2><label><span>Ciudad</span><select name="city_id"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>"><?= escape($city['name']) ?></option><?php endforeach; ?></select></label><label><span>Zona</span><select name="zone_id"><option value="">Sin zona</option><?php foreach ($zones as $zone): ?><option value="<?= (int) $zone['id'] ?>"><?= escape($zone['city_name'] . ' · ' . $zone['name']) ?></option><?php endforeach; ?></select></label><label><span>Tienda</span><input name="store_name" required></label><label><span>Dirección</span><input name="store_address"></label><label><span>Teléfono</span><input name="store_phone"></label><button class="primary" type="submit">Guardar tienda</button></form>
+        </div>
+        <div class="panel"><h2>Tiendas</h2><table><thead><tr><th>Ciudad</th><th>Zona</th><th>Tienda</th><th>Dirección</th></tr></thead><tbody><?php foreach ($stores as $store): ?><tr><td><?= escape($store['city_name']) ?></td><td><?= escape($store['zone_name'] ?? '') ?></td><td><?= escape($store['name']) ?></td><td><?= escape($store['address']) ?></td></tr><?php endforeach; ?></tbody></table></div>
+      </section>
+    <?php elseif ($view === 'users' && can($user, 'users.manage')): ?>
+      <section class="split">
+        <form class="panel stacked" method="post">
+          <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_user"><input type="hidden" name="view" value="users"><input type="hidden" name="user_id" value="<?= escape((string) $formUser['id']) ?>">
+          <h2><?= $editUser ? 'Editar usuario' : 'Crear usuario' ?></h2>
+          <div class="fields"><label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label><label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label><label><span>Rol</span><select name="role"><?php foreach (ROLES as $role): ?><option value="<?= escape($role) ?>" <?= $formUser['role'] === $role ? 'selected' : '' ?>><?= escape(roleLabel($role)) ?></option><?php endforeach; ?></select></label><label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label><label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label></div>
+          <label><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select></label>
+          <label><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select></label>
+          <div class="actions"><button class="primary" type="submit">Guardar usuario</button><?php if ($editUser): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'users')) ?>">Nuevo</a><?php endif; ?></div>
+        </form>
+        <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape(roleLabel($listedUser['role'])) ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
+      </section>
+    <?php elseif ($view === 'stats' && can($user, 'stats.view')): ?>
       <section class="grid">
-      <?php foreach ($orders as $order): ?>
-        <article class="order">
-          <div class="order-head">
-            <div class="order-title">
-              <h2>Pedido #<?= (int) $order['id'] ?> · <?= escape($order['customer_name']) ?></h2>
-              <span class="badge <?= escape($order['status']) ?>"><?= escape(statusLabel($order['status'])) ?></span>
-            </div>
-            <div class="total">$<?= money($order['total']) ?></div>
-          </div>
-          <div class="order-body">
-            <div class="facts">
-              <div class="fact"><span>Teléfono</span><a href="tel:<?= escape($order['phone']) ?>"><?= escape($order['phone']) ?></a></div>
-              <div class="fact"><span>Dirección</span><?= escape($order['delivery_address']) ?></div>
-              <?php if ($order['delivery_notes']): ?><div class="fact"><span>Notas</span><?= escape($order['delivery_notes']) ?></div><?php endif; ?>
-              <div class="fact"><span>Pedido original</span><?= nl2br(escape($order['raw_message'])) ?></div>
-              <div class="fact"><span>Creado</span><?= escape($order['created_at']) ?></div>
-              <?php if ($order['payment_proof_url']): ?><div class="fact"><span>Comprobante</span><a href="<?= escape(imageSrc($basePath, $order['payment_proof_url'])) ?>" target="_blank" rel="noopener">Ver imagen</a></div><?php endif; ?>
-              <?php if ($order['payment_confirmed_by']): ?><div class="fact"><span>Pago verificado por</span><?= escape($order['payment_confirmed_by']) ?> · <?= escape($order['payment_confirmed_at']) ?></div><?php endif; ?>
-            </div>
-            <div class="items">
-              <?php foreach ($order['items'] as $item): ?>
-                <div class="item">
-                  <?php if ($item['image_url']): ?><img src="<?= escape(imageSrc($basePath, $item['image_url'])) ?>" alt="" loading="lazy"><?php else: ?><span></span><?php endif; ?>
-                  <div><strong><?= (int) $item['quantity'] ?> x <?= escape($item['product_name']) ?></strong><br><small><?= escape($item['sku']) ?><?= $item['size'] ? ' · talla ' . escape($item['size']) : '' ?> · $<?= money($item['unit_price']) ?> / unidad</small></div>
-                  <strong>$<?= money((float) $item['quantity'] * (float) $item['unit_price']) ?></strong>
-                </div>
-              <?php endforeach; ?>
-            </div>
-          </div>
-          <div class="actions">
-            <?php if ($order['status'] === 'PENDING_PAYMENT'): ?>
-              <form method="post" action="<?= escape($basePath) ?>">
-                <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
-                <input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>">
-                <input type="hidden" name="action" value="approve">
-                <input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>">
-                <button class="approve" type="submit">Confirmar pago</button>
-              </form>
-              <form method="post" action="<?= escape($basePath) ?>">
-                <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
-                <input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>">
-                <input type="hidden" name="action" value="reject">
-                <input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>">
-                <button class="reject" type="submit">Rechazar pago</button>
-              </form>
-            <?php elseif ($order['status'] === 'CONFIRMED'): ?>
-              <form method="post" action="<?= escape($basePath) ?>">
-                <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
-                <input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>">
-                <input type="hidden" name="action" value="dispatch">
-                <input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>">
-                <button class="dispatch" type="submit">Marcar como despachado</button>
-              </form>
-            <?php endif; ?>
-          </div>
-        </article>
-      <?php endforeach; ?>
+        <div class="summary"><div class="metric"><span>Ventas</span><strong>$<?= money($stats['summary']['sales_total'] ?? 0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int) ($stats['summary']['orders_count'] ?? 0) ?></strong></div><div class="metric"><span>Ticket promedio</span><strong>$<?= money($stats['summary']['average_ticket'] ?? 0) ?></strong></div></div>
+        <div class="panel"><h2>Ventas por tienda</h2><table><thead><tr><th>Tienda</th><th>Pedidos</th><th>Ventas</th></tr></thead><tbody><?php foreach (($stats['stores'] ?? []) as $row): ?><tr><td><?= escape($row['store_name'] ?? 'Sin tienda') ?></td><td><?= (int) $row['orders_count'] ?></td><td>$<?= money($row['sales_total']) ?></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
+    <?php elseif ($view === 'shipments'): ?>
+      <?php if ($shipments === []): ?><div class="empty">No hay envíos visibles para tu rol.</div><?php else: ?><table><thead><tr><th>Pedido</th><th>Tienda</th><th>Cliente</th><th>Dirección</th><th>Productos</th><th>Total</th></tr></thead><tbody><?php foreach ($shipments as $shipment): ?><tr><td>#<?= (int) $shipment['order_id'] ?></td><td><?= escape($shipment['store_name']) ?></td><td><?= escape($shipment['customer_name']) ?><br><span class="muted"><?= escape($shipment['phone']) ?></span></td><td><?= escape($shipment['delivery_address']) ?><?php if ($shipment['delivery_notes']): ?><br><span class="muted"><?= escape($shipment['delivery_notes']) ?></span><?php endif; ?></td><td><?= nl2br(escape($shipment['items'])) ?></td><td>$<?= money($shipment['total']) ?></td></tr><?php endforeach; ?></tbody></table><?php endif; ?>
+    <?php else: ?>
+      <?php if (!can($user, 'orders.view')): ?><div class="empty">Tu rol no tiene bandeja de pedidos.</div><?php else: ?>
+      <nav class="summary"><a class="metric <?= $selectedStatus === 'ALL' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders')) ?>"><span>Todos</span><strong><?= $totalOrders ?></strong></a><?php foreach ($counts as $status => $count): ?><a class="metric <?= $selectedStatus === $status ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders', ['status' => $status])) ?>"><span><?= escape(statusLabel($status)) ?></span><strong><?= $count ?></strong></a><?php endforeach; ?></nav>
+      <section class="grid">
+        <?php foreach ($orders as $order): ?>
+          <article class="order">
+            <div class="head"><div class="title"><h2>Pedido #<?= (int) $order['id'] ?> · <?= escape($order['customer_name']) ?></h2><span class="badge <?= escape($order['status']) ?>"><?= escape(statusLabel($order['status'])) ?></span></div><strong>$<?= money($order['total']) ?></strong></div>
+            <div class="body"><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($order['city_name'] ?? '') . ' · ' . ($order['zone_name'] ?? '') . ' · ' . ($order['store_name'] ?? '')) ?></div><div class="fact"><span>Teléfono</span><a href="tel:<?= escape($order['phone']) ?>"><?= escape($order['phone']) ?></a></div><div class="fact"><span>Dirección</span><?= escape($order['delivery_address']) ?></div><div class="fact"><span>Pedido original</span><?= nl2br(escape($order['raw_message'])) ?></div><?php if ($order['payment_proof_url']): ?><div class="fact"><span>Comprobante</span><a href="<?= escape(imageSrc($basePath, $order['payment_proof_url'])) ?>" target="_blank" rel="noopener">Ver imagen</a></div><?php endif; ?><?php if ($order['reviewer_name']): ?><div class="fact"><span>Revisado por</span><?= escape($order['reviewer_name']) ?></div><?php endif; ?></div><div class="items"><?php foreach ($order['items'] as $item): ?><div class="item"><?php if ($item['image_url']): ?><img src="<?= escape(imageSrc($basePath, $item['image_url'])) ?>" alt="" loading="lazy"><?php else: ?><span></span><?php endif; ?><div><strong><?= (int) $item['quantity'] ?> x <?= escape($item['product_name']) ?></strong><br><small><?= escape($item['sku']) ?><?= $item['size'] ? ' · talla ' . escape($item['size']) : '' ?> · $<?= money($item['unit_price']) ?></small></div><strong>$<?= money((float) $item['quantity'] * (float) $item['unit_price']) ?></strong></div><?php endforeach; ?></div></div>
+            <div class="actions"><?php if ($order['status'] === 'PENDING_PAYMENT'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form><?php elseif ($order['status'] === 'CONFIRMED'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form><?php endif; ?></div>
+          </article>
+        <?php endforeach; ?>
+        <?php if ($orders === []): ?><div class="empty">No hay pedidos visibles en este estado.</div><?php endif; ?>
+      </section>
+      <?php endif; ?>
     <?php endif; ?>
   <?php endif; ?>
 </main>

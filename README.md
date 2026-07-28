@@ -41,6 +41,11 @@ Los valores de `n8n/credentials/local-mariadb.json` son exclusivamente para
 desarrollo local. Al cambiar la contraseña de MariaDB, actualiza también esa
 credencial o créala de nuevo desde la interfaz de n8n.
 
+El panel crea el primer usuario admin automáticamente si la tabla `users` está
+vacía. En local usa `OPERATOR_ADMIN_EMAIL` y `OPERATOR_ADMIN_PASSWORD` desde
+`.env`; si no existen, los valores de desarrollo son `admin@example.com` y
+`ChangeMe123!`.
+
 ## Probar el flujo
 
 ### 1. Crear un pedido pendiente
@@ -112,6 +117,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `operator/`: interfaz protegida para gestionar pedidos.
 - `db/init/001_schema.sql`: tablas, catálogo, procedimientos y vista diaria.
 - `db/migrations/002_catalog_conversations.sql`: catálogo con imágenes, variantes, conversaciones y preparación del vendedor conversacional.
+- `db/migrations/003_roles_locations.sql`: usuarios, roles, ciudades, zonas, tiendas y permisos territoriales.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -193,6 +199,18 @@ imágenes, aplica la migración una vez:
 sh scripts/apply-migrations.sh
 docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 ```
+
+Antes de entrar al panel en producción, configura en `.env.production`:
+
+```bash
+OPERATOR_ADMIN_NAME=Admin
+OPERATOR_ADMIN_EMAIL=correo-admin@dominio.com
+OPERATOR_ADMIN_PASSWORD=una-contraseña-larga
+```
+
+El panel queda en `https://DOMINIO_CONFIGURADO/operator/`. Desde allí el admin
+puede crear proveedores, despachadores y gerentes de ciudad, además de crear
+ciudades, zonas, tiendas y asignaciones.
 
 Prepara la autenticación adicional de Nginx:
 
