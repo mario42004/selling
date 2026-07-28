@@ -36,20 +36,120 @@ Debe:
 - Enviar el pedido al panel de operador para aprobación manual.
 - Responder al comprador cuando el pedido quede aprobado o rechazado.
 
-### Operador
+### Usuarios internos del sistema
 
-Persona humana que usa el panel web.
+Personas humanas que usan el panel web. Ya no existe un único "operador"
+genérico; el sistema debe controlar permisos por rol, ciudad, zona y tienda.
 
-Debe:
+#### Proveedor
 
-- Crear y mantener el catálogo.
-- Subir fotos de productos.
-- Definir precios, tallas, cantidades y categorías.
-- Revisar pedidos pendientes.
+Responsable de cargar y mantener catálogo.
+
+Puede:
+
+- Crear productos.
+- Editar productos propios o asignados.
+- Subir imágenes.
+- Actualizar precios.
+- Actualizar tallas, variantes y cantidades.
+- Activar o desactivar productos según permisos asignados.
+- Ver stock de productos asignados.
+
+No puede:
+
+- Aprobar pagos.
+- Crear usuarios.
+- Ver estadísticas globales.
+- Ver pedidos de zonas o tiendas no asignadas, salvo que el admin lo permita.
+
+#### Despachador
+
+Responsable de revisar pagos y preparar despacho.
+
+Puede:
+
+- Ver pedidos pendientes de aprobación.
 - Ver comprobantes de transferencia.
-- Aprobar o rechazar pagos.
+- Aprobar pagos para que el pedido pase a despacho.
+- Rechazar pagos.
 - Marcar pedidos como despachados.
-- Consultar la tabla diaria de envíos.
+- Ver la tabla de envíos que tiene asignada.
+
+No puede:
+
+- Crear usuarios.
+- Modificar catálogo, salvo ajuste operativo explícito concedido por admin.
+- Ver estadísticas globales.
+
+#### Admin
+
+Responsable total del sistema.
+
+Puede:
+
+- Crear usuarios.
+- Editar usuarios.
+- Activar o desactivar usuarios.
+- Asignar roles.
+- Asignar ciudades, zonas y tiendas.
+- Ver todos los pedidos.
+- Ver todos los productos.
+- Ver todos los comprobantes.
+- Aprobar o rechazar cualquier pedido.
+- Actualizar cualquier catálogo.
+- Ver estadísticas globales.
+- Monitorear todo el flujo conversacional y operativo.
+
+#### Gerente de ciudad
+
+Responsable de una o varias ciudades, zonas o tiendas asignadas.
+
+Puede:
+
+- Ver pedidos de sus ciudades, zonas y tiendas asignadas.
+- Aprobar o rechazar pedidos dentro de su alcance geográfico y comercial.
+- Ver comprobantes dentro de su alcance.
+- Actualizar catálogo de tiendas asignadas.
+- Ver estadísticas de ventas por periodo dentro de su alcance.
+- Ver desempeño por tienda, categoría, producto, día y estado.
+
+No puede:
+
+- Crear admins.
+- Ver ciudades, zonas o tiendas no asignadas.
+- Cambiar permisos globales del sistema.
+
+## Matriz de permisos
+
+| Funcionalidad | Proveedor | Despachador | Gerente de ciudad | Admin |
+| --- | --- | --- | --- | --- |
+| Ver catálogo asignado | Sí | Opcional | Sí | Sí |
+| Crear producto | Sí | No | Sí, en tiendas asignadas | Sí |
+| Editar producto | Sí | No | Sí, en tiendas asignadas | Sí |
+| Subir imágenes | Sí | No | Sí, en tiendas asignadas | Sí |
+| Actualizar stock | Sí | No | Sí, en tiendas asignadas | Sí |
+| Ver pedidos | Limitado | Sí, asignados | Sí, por alcance | Sí |
+| Ver comprobantes | No | Sí | Sí, por alcance | Sí |
+| Aprobar pago | No | Sí | Sí, por alcance | Sí |
+| Rechazar pago | No | Sí | Sí, por alcance | Sí |
+| Marcar despachado | No | Sí | Sí, por alcance | Sí |
+| Ver tabla de envíos | No | Sí, asignada | Sí, por alcance | Sí |
+| Ver estadísticas | No | No | Sí, por alcance | Sí |
+| Crear usuarios | No | No | No | Sí |
+| Asignar roles | No | No | No | Sí |
+
+## Alcance por ciudad, zona y tienda
+
+Cada producto, pedido y usuario interno debe poder relacionarse con una tienda.
+Cada tienda pertenece a una zona y ciudad. Los permisos se calculan por ese
+alcance.
+
+Ejemplo:
+
+- Admin ve todo.
+- Gerente de Bogotá Norte ve pedidos y catálogo de Bogotá Norte.
+- Despachador de Tienda Centro ve pedidos asignados a esa tienda.
+- Proveedor de Tienda Centro actualiza solo productos de esa tienda.
 
 ## Flujo general esperado
 
@@ -143,7 +243,8 @@ Variantes:
 
 ## Panel de catálogo
 
-Debe ser una interfaz web clara para que el operador cargue productos.
+Debe ser una interfaz web clara para que proveedor, gerente de ciudad o admin
+carguen productos según su alcance.
 
 Pantallas necesarias:
 
@@ -175,7 +276,7 @@ Validaciones:
 
 ## Panel de pedidos
 
-El panel actual debe evolucionar.
+El panel actual debe evolucionar y mostrar acciones según rol.
 
 Debe mostrar:
 
@@ -191,6 +292,9 @@ Debe mostrar:
 - Imagen del comprobante.
 - Fecha de creación.
 - Botones de aprobar, rechazar y despachar.
+- Ciudad, zona y tienda asociada.
+- Usuario que aprobó o rechazó.
+- Usuario que marcó despacho.
 
 Estados visibles para operador:
 
@@ -200,6 +304,60 @@ Estados visibles para operador:
 - Rechazado.
 - Despachado.
 - Cancelado.
+
+Reglas de acceso:
+
+- Proveedor solo ve pedidos relacionados con productos o tiendas asignadas si el admin lo habilita.
+- Despachador ve y gestiona pedidos de tiendas asignadas.
+- Gerente de ciudad ve y gestiona pedidos de ciudades, zonas o tiendas asignadas.
+- Admin ve y gestiona todo.
+
+## Panel de usuarios
+
+Debe existir una sección solo para admin.
+
+Pantallas necesarias:
+
+- Lista de usuarios.
+- Crear usuario.
+- Editar usuario.
+- Activar/desactivar usuario.
+- Cambiar rol.
+- Asignar ciudades.
+- Asignar zonas o tiendas.
+
+Validaciones:
+
+- Solo admin puede crear usuarios.
+- Solo admin puede asignar rol `ADMIN`.
+- Un usuario inactivo no puede entrar al sistema.
+- Todo cambio de rol o asignación debe quedar auditado.
+
+## Panel de estadísticas
+
+Debe estar disponible para admin y gerente de ciudad.
+
+Debe permitir filtrar por:
+
+- Periodo.
+- Ciudad.
+- Zona.
+- Tienda.
+- Categoría.
+- Producto.
+- Estado del pedido.
+
+Métricas mínimas:
+
+- Ventas totales.
+- Número de pedidos.
+- Ticket promedio.
+- Productos más vendidos.
+- Pedidos aprobados.
+- Pedidos rechazados.
+- Pedidos pendientes.
+- Ventas por día.
+- Ventas por tienda.
 
 ## Envío de imágenes por WhatsApp
 
@@ -268,6 +426,103 @@ Recomendación inicial:
 
 ## Base de datos propuesta
 
+### `users`
+
+Usuarios internos del sistema.
+
+Campos:
+
+- `id`
+- `name`
+- `email`
+- `password_hash`
+- `role`
+- `active`
+- `last_login_at`
+- `created_at`
+- `updated_at`
+
+Roles válidos:
+
+- `PROVIDER`
+- `DISPATCHER`
+- `CITY_MANAGER`
+- `ADMIN`
+
+### `cities`
+
+Ciudades donde opera el sistema.
+
+Campos:
+
+- `id`
+- `name`
+- `active`
+- `created_at`
+- `updated_at`
+
+### `zones`
+
+Zonas dentro de una ciudad.
+
+Campos:
+
+- `id`
+- `city_id`
+- `name`
+- `active`
+- `created_at`
+- `updated_at`
+
+### `stores`
+
+Tiendas o unidades comerciales.
+
+Campos:
+
+- `id`
+- `city_id`
+- `zone_id`
+- `name`
+- `address`
+- `phone`
+- `active`
+- `created_at`
+- `updated_at`
+
+### `user_store_assignments`
+
+Relación entre usuarios y tiendas.
+
+Campos:
+
+- `id`
+- `user_id`
+- `store_id`
+- `created_at`
+
+Uso:
+
+- Proveedor: tiendas donde puede actualizar catálogo.
+- Despachador: tiendas cuyos pedidos puede aprobar/despachar.
+- Gerente de ciudad: tiendas dentro de su alcance.
+
+### `user_city_assignments`
+
+Relación entre gerentes y ciudades.
+
+Campos:
+
+- `id`
+- `user_id`
+- `city_id`
+- `created_at`
+
+Uso:
+
+- Gerente de ciudad puede ver y aprobar pedidos de sus ciudades.
+- Admin puede ver todo sin asignaciones.
+
 ### `products`
 
 Productos generales.
@@ -275,6 +530,7 @@ Productos generales.
 Campos:
 
 - `id`
+- `store_id`
 - `name`
 - `description`
 - `category`
@@ -357,6 +613,9 @@ Campos:
 
 - `id`
 - `conversation_id`
+- `store_id`
+- `city_id`
+- `zone_id`
 - `customer_name`
 - `phone`
 - `delivery_address`
@@ -519,25 +778,48 @@ El LLM nunca debe inventar productos, precios ni stock.
 
 Objetivo:
 
-Preparar el modelo para catálogo real, variantes, imágenes, conversaciones y comprobantes.
+Preparar el modelo para catálogo real, variantes, imágenes, conversaciones, comprobantes, usuarios internos y alcance geográfico.
 
 Tareas:
 
 - Crear migración SQL nueva.
 - Mantener compatibilidad con pedidos existentes si es posible.
+- Agregar usuarios, roles, ciudades, zonas, tiendas y asignaciones.
 - Agregar tablas de catálogo, imágenes, variantes y conversaciones.
 - Agregar campos para comprobante en pedidos.
+- Asociar productos y pedidos con tienda, zona y ciudad.
 - Agregar vista de envíos.
 
 Resultado esperado:
 
-La base puede representar productos reales con tallas, precios, fotos y stock.
+La base puede representar productos reales con tallas, precios, fotos, stock y permisos por rol/territorio.
 
-### Etapa 2: construir panel de catálogo
+### Etapa 2: autenticación, usuarios y permisos
 
 Objetivo:
 
-Permitir al operador administrar productos desde el navegador.
+Crear el acceso seguro al backoffice con roles reales.
+
+Tareas:
+
+- Crear login.
+- Crear cierre de sesión.
+- Crear usuario admin inicial por variables de entorno o script.
+- Crear CRUD de usuarios para admin.
+- Implementar roles `PROVIDER`, `DISPATCHER`, `CITY_MANAGER`, `ADMIN`.
+- Implementar asignación de ciudades, zonas y tiendas.
+- Filtrar vistas y acciones según rol.
+- Registrar auditoría de acciones sensibles.
+
+Resultado esperado:
+
+Cada usuario entra con su cuenta y solo ve o ejecuta lo que su rol permite.
+
+### Etapa 3: construir panel de catálogo
+
+Objetivo:
+
+Permitir administrar productos desde el navegador según permisos.
 
 Tareas:
 
@@ -547,12 +829,14 @@ Tareas:
 - Subir imágenes.
 - Gestionar variantes por talla y cantidad.
 - Activar/desactivar productos.
+- Asociar productos a tienda.
+- Filtrar catálogo por tienda, zona y ciudad según rol.
 
 Resultado esperado:
 
-El operador puede cargar catálogo sin tocar SQL.
+Proveedor, gerente de ciudad y admin pueden cargar catálogo sin tocar SQL, dentro de su alcance.
 
-### Etapa 3: mejorar panel de pedidos
+### Etapa 4: mejorar panel de pedidos
 
 Objetivo:
 
@@ -566,12 +850,35 @@ Tareas:
 - Aprobar/rechazar pago.
 - Marcar despachado.
 - Mostrar tabla de envíos.
+- Filtrar pedidos por ciudad, zona y tienda.
+- Restringir aprobación según rol y alcance.
 
 Resultado esperado:
 
-El operador puede revisar ventas reales y gestionar despacho.
+Despachador, gerente de ciudad y admin pueden revisar ventas reales y gestionar despacho según permisos.
 
-### Etapa 4: crear motor conversacional básico
+### Etapa 5: estadísticas por periodo
+
+Objetivo:
+
+Dar visibilidad de ventas a admin y gerente de ciudad.
+
+Tareas:
+
+- Crear filtros por periodo.
+- Mostrar ventas totales.
+- Mostrar número de pedidos.
+- Mostrar ticket promedio.
+- Mostrar productos más vendidos.
+- Mostrar ventas por tienda.
+- Mostrar ventas por estado.
+- Restringir datos según alcance del usuario.
+
+Resultado esperado:
+
+Admin ve todo el negocio y gerente de ciudad ve sus ciudades, zonas o tiendas asignadas.
+
+### Etapa 6: crear motor conversacional básico
 
 Objetivo:
 
@@ -589,7 +896,7 @@ Resultado esperado:
 
 El bot puede responder búsquedas y esperar selección.
 
-### Etapa 5: enviar opciones con imágenes por WhatsApp
+### Etapa 7: enviar opciones con imágenes por WhatsApp
 
 Objetivo:
 
@@ -606,7 +913,7 @@ Resultado esperado:
 
 El comprador puede escoger producto desde opciones visuales.
 
-### Etapa 6: crear pedido conversacional
+### Etapa 8: crear pedido conversacional
 
 Objetivo:
 
@@ -624,7 +931,7 @@ Resultado esperado:
 
 El sistema crea pedidos reales desde una conversación natural.
 
-### Etapa 7: comprobante y aprobación manual
+### Etapa 9: comprobante y aprobación manual
 
 Objetivo:
 
@@ -642,7 +949,7 @@ Resultado esperado:
 
 El pago queda bajo control humano y el comprador recibe confirmación.
 
-### Etapa 8: logística y resumen diario
+### Etapa 10: logística y resumen diario
 
 Objetivo:
 
@@ -659,7 +966,7 @@ Resultado esperado:
 
 El operador tiene una vista clara de qué enviar cada día.
 
-### Etapa 9: endurecimiento y producción
+### Etapa 11: endurecimiento y producción
 
 Objetivo:
 
@@ -684,7 +991,14 @@ El sistema queda listo para uso continuo en producción.
 
 El sistema se considera listo cuando:
 
-- El operador puede crear productos con fotos, tallas, cantidades y precios.
+- Admin puede crear usuarios y asignar roles.
+- Admin puede asignar ciudades, zonas y tiendas.
+- Cada usuario ve solo las funcionalidades permitidas por su rol.
+- Cada usuario ve solo las ciudades, zonas o tiendas de su alcance, salvo admin.
+- Proveedor puede crear productos con fotos, tallas, cantidades y precios.
+- Gerente de ciudad puede actualizar catálogo dentro de su alcance.
+- Gerente de ciudad puede ver estadísticas por periodo dentro de su alcance.
+- Despachador puede aprobar pagos y marcar despachos asignados.
 - El comprador puede preguntar por WhatsApp usando lenguaje natural.
 - El bot responde con opciones del catálogo real.
 - El comprador puede escoger una opción.
@@ -704,18 +1018,25 @@ El sistema se considera listo cuando:
 - Dónde guardar imágenes: disco local, volumen Docker, S3 u otro servicio.
 - Si se usará LLM desde el inicio o primero reglas simples.
 - Qué campos exactos de entrega son obligatorios.
+- Si un proveedor puede pertenecer a varias tiendas.
+- Si un despachador aprueba por tienda, zona o ciudad.
+- Si el gerente de ciudad puede crear proveedores o solo admin.
+- Qué estadísticas exactas necesita cada gerente.
 
 ## Recomendación de implementación
 
 Construir en este orden:
 
 1. Base de datos.
-2. Panel de catálogo.
-3. Panel de pedidos mejorado.
-4. Conversación básica por WhatsApp.
-5. Envío de imágenes.
-6. Comprobante y aprobación.
-7. Logística.
-8. Pruebas y producción.
+2. Login, usuarios, roles y permisos.
+3. Ciudades, zonas, tiendas y asignaciones.
+4. Panel de catálogo con alcance por tienda.
+5. Panel de pedidos con aprobación por rol y territorio.
+6. Estadísticas para admin y gerente de ciudad.
+7. Conversación básica por WhatsApp.
+8. Envío de imágenes.
+9. Comprobante y aprobación.
+10. Logística.
+11. Pruebas y producción.
 
-La razón es que el bot depende del catálogo. Primero debe existir una forma confiable de cargar productos, imágenes, tallas, precios y stock. Después n8n puede vender usando esa información.
+La razón es que el bot depende del catálogo, y el catálogo depende de permisos. Primero debe existir una forma confiable de saber quién puede ver, crear, aprobar o modificar cada cosa. Después n8n puede vender usando esa información.
