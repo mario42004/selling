@@ -4,3 +4,15 @@
 *.log
 .agents/
 .codex/
+
+# Local planning/state only. Do not publish these to GitHub.
+ESTADO_ACTUAL.md
+diseño.md
+diseno.md
+DISEÑO.md
+DISENO.md
+prompts/
+prompt/
+*.prompt.md
+*_prompt.md
+PROMPTS.md
