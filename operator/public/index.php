@@ -27,15 +27,6 @@ if (!isset($_SESSION['csrf'])) {
 }
 
 const ORDER_STATUSES = ['ALL', 'PENDING_PAYMENT', 'CONFIRMED', 'REJECTED', 'CANCELLED', 'DISPATCHED'];
-const ROLES = ['SELLER', 'PROVIDER', 'DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'];
-const ROLE_LABELS = [
-    'SELLER' => 'Vendedor',
-    'PROVIDER' => 'Proveedor',
-    'DISPATCHER' => 'Despachador',
-    'STORE_MANAGER' => 'Gerente de tienda',
-    'CITY_MANAGER' => 'Gerente de ciudad',
-    'ADMIN' => 'Admin global',
-];
 
 function requiredEnvironment(string $name): string
 {
@@ -90,9 +81,19 @@ function statusLabel(string $status): string
     };
 }
 
-function roleLabel(string $role): string
+function roleSummary(array $user): string
 {
-    return ROLE_LABELS[$role] ?? $role;
+    $names = $user['role_names'] ?? [];
+    return is_array($names) && $names !== [] ? implode(' · ', $names) : 'Sin rol';
+}
+
+function scopeLabel(string $scopeLevel): string
+{
+    return match ($scopeLevel) {
+        'GLOBAL' => 'alcance global',
+        'CITY' => 'alcance de ciudad',
+        default => 'alcance de tienda',
+    };
 }
 
 function viewUrl(string $basePath, string $view, array $params = []): string
@@ -181,6 +182,49 @@ function ensureBootstrapAdmin(PDO $pdo): void
     $password = getenv('OPERATOR_ADMIN_PASSWORD') ?: 'ChangeMe123!';
     $statement = $pdo->prepare("INSERT INTO users (name, email, password_hash, role, active) VALUES (?, ?, ?, 'ADMIN', TRUE)");
     $statement->execute([$name, strtolower($email), password_hash($password, PASSWORD_DEFAULT)]);
+    $userId = (int) $pdo->lastInsertId();
+    $pdo->prepare("INSERT INTO user_roles (user_id, role_id) SELECT ?, id FROM roles WHERE code = 'ADMIN'")
+        ->execute([$userId]);
+}
+
+function loadAuthorization(PDO $pdo, array $user): array
+{
+    $statement = $pdo->prepare(
+        'SELECT r.code, r.name, r.scope_level
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE ur.user_id = ? AND r.active = TRUE
+         ORDER BY r.id'
+    );
+    $statement->execute([(int) $user['id']]);
+    $roles = $statement->fetchAll();
+    $user['role_codes'] = array_column($roles, 'code');
+    $user['role_names'] = array_column($roles, 'name');
+    $user['scope_levels'] = array_values(array_unique(array_column($roles, 'scope_level')));
+
+    $statement = $pdo->prepare(
+        'SELECT DISTINCT p.code
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id AND r.active = TRUE
+         JOIN role_permissions rp ON rp.role_id = r.id
+         JOIN permissions p ON p.id = rp.permission_id
+         WHERE ur.user_id = ?
+         ORDER BY p.code'
+    );
+    $statement->execute([(int) $user['id']]);
+    $user['permissions'] = $statement->fetchAll(PDO::FETCH_COLUMN);
+    return $user;
+}
+
+function hasScope(array $user, string $scopeLevel): bool
+{
+    $scopes = $user['scope_levels'] ?? [];
+    return match ($scopeLevel) {
+        'GLOBAL' => in_array('GLOBAL', $scopes, true),
+        'CITY' => in_array('GLOBAL', $scopes, true) || in_array('CITY', $scopes, true),
+        'STORE' => $scopes !== [],
+        default => false,
+    };
 }
 
 function currentUser(PDO $pdo): ?array
@@ -192,36 +236,23 @@ function currentUser(PDO $pdo): ?array
     $statement = $pdo->prepare('SELECT * FROM users WHERE id = ? AND active = TRUE');
     $statement->execute([(int) $userId]);
     $user = $statement->fetch();
-    return is_array($user) ? $user : null;
+    return is_array($user) ? loadAuthorization($pdo, $user) : null;
 }
 
 function can(array $user, string $permission): bool
 {
-    $role = (string) $user['role'];
-    return match ($permission) {
-        'catalog.write' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'inventory.transfer' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
-        'orders.cancel' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'orders.delete' => $role === 'ADMIN',
-        'orders.view' => in_array($role, ['SELLER', 'DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'orders.approve' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
-        'shipments.view' => in_array($role, ['DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'stats.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'inventory.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'users.manage', 'locations.manage' => $role === 'ADMIN',
-        default => false,
-    };
+    return in_array($permission, $user['permissions'] ?? [], true);
 }
 
 function assignedStoreIds(PDO $pdo, array $user): array
 {
-    if ($user['role'] === 'ADMIN') {
+    if (hasScope($user, 'GLOBAL')) {
         return [];
     }
     $statement = $pdo->prepare('SELECT store_id FROM user_store_assignments WHERE user_id = ?');
     $statement->execute([(int) $user['id']]);
     $storeIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
-    if ($user['role'] === 'CITY_MANAGER') {
+    if (hasScope($user, 'CITY')) {
         $statement = $pdo->prepare(
             'SELECT s.id FROM stores s JOIN user_city_assignments uca ON uca.city_id = s.city_id WHERE uca.user_id = ?'
         );
@@ -233,7 +264,7 @@ function assignedStoreIds(PDO $pdo, array $user): array
 
 function scopedWhere(PDO $pdo, array $user, string $alias, array &$params): string
 {
-    if ($user['role'] === 'ADMIN') {
+    if (hasScope($user, 'GLOBAL')) {
         return '1=1';
     }
     $storeIds = assignedStoreIds($pdo, $user);
@@ -300,7 +331,7 @@ function uploadImage(): ?string
 
 function assertStoreAccess(PDO $pdo, array $user, int $storeId): void
 {
-    if ($user['role'] === 'ADMIN') {
+    if (hasScope($user, 'GLOBAL')) {
         return;
     }
     if (!in_array($storeId, assignedStoreIds($pdo, $user), true)) {
@@ -470,6 +501,52 @@ function deleteProduct(PDO $pdo, array $user): void
     }
 }
 
+function restockInventory(PDO $pdo, array $user): void
+{
+    if (!can($user, 'inventory.restock')) {
+        throw new RuntimeException('No tienes permiso para alimentar inventario.');
+    }
+    $variantId = filter_var($_POST['variant_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $quantity = filter_var($_POST['quantity'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $notes = trim((string) ($_POST['notes'] ?? ''));
+    if ($variantId === false || $quantity === false) {
+        throw new RuntimeException('Selecciona un producto y una cantidad mayor que cero.');
+    }
+    if (strlen($notes) > 500) {
+        throw new RuntimeException('Las notas no pueden superar 500 caracteres.');
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $statement = $pdo->prepare(
+            'SELECT pv.id AS variant_id, pv.product_id, p.store_id
+             FROM product_variants pv
+             JOIN products p ON p.id = pv.product_id
+             WHERE pv.id = ? AND pv.active = TRUE AND p.active = TRUE AND p.deleted_at IS NULL
+             FOR UPDATE'
+        );
+        $statement->execute([(int) $variantId]);
+        $variant = $statement->fetch();
+        if (!is_array($variant)) {
+            throw new RuntimeException('Producto o variante no disponible.');
+        }
+        assertStoreAccess($pdo, $user, (int) $variant['store_id']);
+
+        $pdo->prepare('UPDATE product_variants SET stock = stock + ? WHERE id = ?')
+            ->execute([(int) $quantity, (int) $variantId]);
+        $pdo->prepare('UPDATE products SET stock = (SELECT COALESCE(SUM(stock), 0) FROM product_variants WHERE product_id = products.id) WHERE id = ?')
+            ->execute([(int) $variant['product_id']]);
+        $pdo->prepare('INSERT INTO inventory_receipts (store_id, product_id, variant_id, quantity, actor_user_id, notes) VALUES (?, ?, ?, ?, ?, ?)')
+            ->execute([(int) $variant['store_id'], (int) $variant['product_id'], (int) $variantId, (int) $quantity, (int) $user['id'], $notes ?: null]);
+        $pdo->commit();
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+}
+
 function transferStock(PDO $pdo, array $user): void
 {
     if (!can($user, 'inventory.transfer')) {
@@ -513,7 +590,7 @@ function transferStock(PDO $pdo, array $user): void
         if ($targetCityId === false) {
             throw new RuntimeException('Tienda destino no encontrada.');
         }
-        if ($user['role'] !== 'ADMIN' && (int) $targetCityId !== (int) $source['city_id']) {
+        if (!hasScope($user, 'GLOBAL') && (int) $targetCityId !== (int) $source['city_id']) {
             throw new RuntimeException('El gerente de ciudad solo puede trasladar existencias dentro de la misma ciudad.');
         }
 
@@ -769,20 +846,24 @@ function saveUser(PDO $pdo): int
     $userId = filter_var($_POST['user_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
     $name = trim((string) ($_POST['name'] ?? ''));
     $email = strtolower(trim((string) ($_POST['email'] ?? '')));
-    $role = strtoupper(trim((string) ($_POST['role'] ?? '')));
+    $roleCodes = array_values(array_unique(array_filter(array_map(
+        static fn ($role): string => strtoupper(trim((string) $role)),
+        is_array($_POST['role_codes'] ?? null) ? $_POST['role_codes'] : []
+    ))));
     $password = (string) ($_POST['password'] ?? '');
     $active = isset($_POST['active']) ? 1 : 0;
-    if ($name === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || !in_array($role, ROLES, true)) {
-        throw new RuntimeException('Nombre, email y rol son obligatorios.');
+    if ($name === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || $roleCodes === []) {
+        throw new RuntimeException('Nombre, email y al menos un rol son obligatorios.');
+    }
+    $placeholders = implode(',', array_fill(0, count($roleCodes), '?'));
+    $statement = $pdo->prepare("SELECT code, scope_level FROM roles WHERE active = TRUE AND code IN ({$placeholders})");
+    $statement->execute($roleCodes);
+    $selectedRoles = $statement->fetchAll();
+    if (count($selectedRoles) !== count($roleCodes)) {
+        throw new RuntimeException('Uno o más roles no son válidos.');
     }
     $assignedCityIds = normalizeIds($_POST['assigned_city_ids'] ?? []);
     $assignedStoreIds = normalizeIds($_POST['assigned_store_ids'] ?? []);
-    if ($role !== 'ADMIN' && $assignedStoreIds === []) {
-        throw new RuntimeException('Los roles operativos deben tener al menos una tienda asignada.');
-    }
-    if (in_array($role, ['SELLER', 'STORE_MANAGER', 'CITY_MANAGER'], true) && $assignedCityIds === []) {
-        throw new RuntimeException('Vendedor, gerente de tienda y gerente de ciudad deben tener al menos una ciudad asignada.');
-    }
     if ($assignedStoreIds !== []) {
         $placeholders = implode(',', array_fill(0, count($assignedStoreIds), '?'));
         $statement = $pdo->prepare("SELECT DISTINCT city_id FROM stores WHERE id IN ({$placeholders})");
@@ -790,18 +871,47 @@ function saveUser(PDO $pdo): int
         $storeCityIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
         $assignedCityIds = array_values(array_unique(array_merge($assignedCityIds, $storeCityIds)));
     }
+    $selectedScopes = array_column($selectedRoles, 'scope_level');
+    $hasGlobalScope = in_array('GLOBAL', $selectedScopes, true);
+    if (!$hasGlobalScope && $assignedStoreIds === []) {
+        throw new RuntimeException('Los roles con alcance territorial deben tener al menos una tienda asignada.');
+    }
+    if (in_array('CITY', $selectedScopes, true) && $assignedCityIds === []) {
+        throw new RuntimeException('Los roles con alcance de ciudad deben tener al menos una ciudad asignada.');
+    }
+    $isAdmin = in_array('ADMIN', $roleCodes, true);
+    $legacyRole = $isAdmin ? 'ADMIN' : $roleCodes[0];
+    if ($userId !== false && (!$isAdmin || $active !== 1)) {
+        $statement = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM users u
+             JOIN user_roles ur ON ur.user_id = u.id
+             JOIN roles r ON r.id = ur.role_id AND r.code = 'ADMIN'
+             WHERE u.active = TRUE AND u.id <> ?"
+        );
+        $statement->execute([(int) $userId]);
+        $otherActiveAdmins = (int) $statement->fetchColumn();
+        $statement = $pdo->prepare(
+            "SELECT COUNT(*) FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND r.code = 'ADMIN'"
+        );
+        $statement->execute([(int) $userId]);
+        if ((int) $statement->fetchColumn() > 0 && $otherActiveAdmins === 0) {
+            throw new RuntimeException('No puedes retirar o desactivar el último admin global activo.');
+        }
+    }
 
     $pdo->beginTransaction();
     try {
         if ($userId !== false) {
             if ($password !== '') {
                 $statement = $pdo->prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ?, password_hash = ? WHERE id = ?');
-                $statement->execute([$name, $email, $role, $active, password_hash($password, PASSWORD_DEFAULT), (int) $userId]);
+                $statement->execute([$name, $email, $legacyRole, $active, password_hash($password, PASSWORD_DEFAULT), (int) $userId]);
             } else {
                 $statement = $pdo->prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ? WHERE id = ?');
-                $statement->execute([$name, $email, $role, $active, (int) $userId]);
+                $statement->execute([$name, $email, $legacyRole, $active, (int) $userId]);
             }
             $savedId = (int) $userId;
+            $pdo->prepare('DELETE FROM user_roles WHERE user_id = ?')->execute([$savedId]);
             $pdo->prepare('DELETE FROM user_store_assignments WHERE user_id = ?')->execute([$savedId]);
             $pdo->prepare('DELETE FROM user_city_assignments WHERE user_id = ?')->execute([$savedId]);
         } else {
@@ -809,10 +919,14 @@ function saveUser(PDO $pdo): int
                 throw new RuntimeException('La contraseña es obligatoria para usuarios nuevos.');
             }
             $statement = $pdo->prepare('INSERT INTO users (name, email, password_hash, role, active) VALUES (?, ?, ?, ?, ?)');
-            $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT), $role, $active]);
+            $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT), $legacyRole, $active]);
             $savedId = (int) $pdo->lastInsertId();
         }
 
+        $roleStatement = $pdo->prepare('INSERT INTO user_roles (user_id, role_id) SELECT ?, id FROM roles WHERE code = ? AND active = TRUE');
+        foreach ($roleCodes as $roleCode) {
+            $roleStatement->execute([$savedId, $roleCode]);
+        }
         $cityStatement = $pdo->prepare('INSERT IGNORE INTO user_city_assignments (user_id, city_id) VALUES (?, ?)');
         foreach ($assignedCityIds as $cityId) {
             $cityStatement->execute([$savedId, $cityId]);
@@ -833,7 +947,7 @@ function saveUser(PDO $pdo): int
 
 function assertOrderAccess(PDO $pdo, array $user, int $orderId): void
 {
-    if ($user['role'] === 'ADMIN') {
+    if (hasScope($user, 'GLOBAL')) {
         return;
     }
     $statement = $pdo->prepare('SELECT store_id FROM orders WHERE id = ?');
@@ -911,7 +1025,7 @@ if ($user !== null && can($user, 'users.manage')) {
 if ($user === null) {
     $view = 'login';
 } elseif (!in_array($view, $allowedViews, true)) {
-    $view = $allowedViews[0];
+    $view = $allowedViews[0] ?? 'no_access';
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof PDO) {
@@ -947,6 +1061,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
         if ($action === 'delete_product') {
             deleteProduct($pdo, $user);
             redirectWithFlash($basePath, 'Producto eliminado del catálogo.', 'success', 'catalog');
+        }
+        if ($action === 'restock_inventory') {
+            restockInventory($pdo, $user);
+            redirectWithFlash($basePath, 'Entrada de inventario registrada.', 'success', 'inventory');
         }
         if ($action === 'transfer_stock') {
             transferStock($pdo, $user);
@@ -1033,12 +1151,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
 }
 
 $counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
-$orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = $transferVariants = $inventoryStore = $inventoryCity = [];
+$orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = $transferVariants = $restockVariants = $inventoryStore = $inventoryCity = [];
 $visibleStores = [];
 $editProduct = null;
 $editVariants = [];
 $editUser = null;
-$editUserCityIds = $editUserStoreIds = [];
+$availableRoles = $editUserRoleCodes = $editUserCityIds = $editUserStoreIds = [];
 
 if ($pdo instanceof PDO && $user !== null) {
     $cities = $pdo->query('SELECT * FROM cities ORDER BY name')->fetchAll();
@@ -1053,7 +1171,7 @@ if ($pdo instanceof PDO && $user !== null) {
          ORDER BY c.name, z.name, s.name"
     )->fetchAll();
     $visibleStores = $stores;
-    if ($user['role'] !== 'ADMIN') {
+    if (!hasScope($user, 'GLOBAL')) {
         $storeIds = assignedStoreIds($pdo, $user);
         $visibleStores = array_values(array_filter($stores, fn ($store) => in_array((int) $store['id'], $storeIds, true)));
     }
@@ -1140,6 +1258,22 @@ if ($pdo instanceof PDO && $user !== null) {
         $transferVariants = $statement->fetchAll();
     }
 
+    if (can($user, 'inventory.restock')) {
+        $params = [];
+        $where = scopedWhere($pdo, $user, 'p', $params);
+        $statement = $pdo->prepare(
+            "SELECT pv.id AS variant_id, pv.stock, pv.size, pv.sku, p.name, s.name AS store_name, c.name AS city_name
+             FROM product_variants pv
+             JOIN products p ON p.id = pv.product_id
+             JOIN stores s ON s.id = p.store_id
+             JOIN cities c ON c.id = s.city_id
+             WHERE {$where} AND p.deleted_at IS NULL AND p.active = TRUE AND pv.active = TRUE
+             ORDER BY c.name, s.name, p.name, pv.size"
+        );
+        $statement->execute($params);
+        $restockVariants = $statement->fetchAll();
+    }
+
     if (can($user, 'inventory.view')) {
         $params = [];
         $where = scopedWhere($pdo, $user, 'ibs', $params);
@@ -1152,7 +1286,7 @@ if ($pdo instanceof PDO && $user !== null) {
         $statement->execute($params);
         $inventoryStore = $statement->fetchAll();
 
-        if ($user['role'] === 'ADMIN') {
+        if (hasScope($user, 'GLOBAL')) {
             $statement = $pdo->query('SELECT * FROM inventory_by_city ORDER BY city_name, product_name, size');
             $inventoryCity = $statement->fetchAll();
         } else {
@@ -1223,13 +1357,24 @@ if ($pdo instanceof PDO && $user !== null) {
     }
 
     if (can($user, 'users.manage')) {
-        $users = $pdo->query('SELECT * FROM users ORDER BY active DESC, role, name')->fetchAll();
+        $availableRoles = $pdo->query('SELECT code, name, scope_level FROM roles WHERE active = TRUE ORDER BY id')->fetchAll();
+        $users = $pdo->query(
+            "SELECT u.*, GROUP_CONCAT(r.name ORDER BY r.id SEPARATOR ' · ') AS role_names_text
+             FROM users u
+             LEFT JOIN user_roles ur ON ur.user_id = u.id
+             LEFT JOIN roles r ON r.id = ur.role_id
+             GROUP BY u.id
+             ORDER BY u.active DESC, u.name"
+        )->fetchAll();
         $editUserId = filter_var($_GET['edit_user'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
         if ($editUserId !== false && $editUserId !== null) {
             $statement = $pdo->prepare('SELECT * FROM users WHERE id = ?');
             $statement->execute([(int) $editUserId]);
             $editUser = $statement->fetch() ?: null;
             if ($editUser !== null) {
+                $statement = $pdo->prepare('SELECT r.code FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ? ORDER BY r.id');
+                $statement->execute([(int) $editUserId]);
+                $editUserRoleCodes = $statement->fetchAll(PDO::FETCH_COLUMN);
                 $statement = $pdo->prepare('SELECT city_id FROM user_city_assignments WHERE user_id = ?');
                 $statement->execute([(int) $editUserId]);
                 $editUserCityIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
@@ -1246,11 +1391,12 @@ unset($_SESSION['flash']);
 $totalOrders = array_sum($counts);
 $formProduct = $editProduct ?? ['id' => '', 'store_id' => $visibleStores[0]['id'] ?? '', 'name' => '', 'description' => '', 'category' => '', 'type' => '', 'brand' => '', 'color' => '', 'gender' => '', 'price' => '', 'sale_price' => '', 'image_url' => '', 'aliases' => '[]', 'active' => 1];
 if ($editVariants === []) {
-    $editVariants = [['sku' => '', 'size' => '', 'stock' => 0]];
+    $editVariants = [['id' => '', 'sku' => '', 'size' => '', 'stock' => 0]];
 }
 $decodedAliases = json_decode((string) ($formProduct['aliases'] ?? '[]'), true);
 $aliasesText = is_array($decodedAliases) ? implode("\n", $decodedAliases) : '';
-$formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SELLER', 'active' => 1];
+$formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'active' => 1];
+$formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
 ?>
 <!doctype html>
 <html lang="es">
@@ -1333,7 +1479,7 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
       <p>Catálogo, pagos, usuarios y despacho</p>
     </section>
     <?php if ($user): ?>
-      <p><?= escape($user['name']) ?><br><strong><?= escape(roleLabel((string) $user['role'])) ?></strong> · <a href="<?= escape($basePath) ?>?logout=1" style="color:#fff">Salir</a></p>
+      <p><?= escape($user['name']) ?><br><strong><?= escape(roleSummary($user)) ?></strong> · <a href="<?= escape($basePath) ?>?logout=1" style="color:#fff">Salir</a></p>
     <?php endif; ?>
   </div>
 </header>
@@ -1385,7 +1531,7 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
           </div>
           <h3>Tallas y cantidades</h3>
           <?php for ($i = 0; $i < max(5, count($editVariants)); $i++): $variant = $editVariants[$i] ?? ['id' => '', 'sku' => '', 'size' => '', 'stock' => '']; ?>
-            <div class="variant-row"><input type="hidden" name="variant_id[]" value="<?= escape((string) $variant['id']) ?>"><input name="variant_size[]" value="<?= escape((string) $variant['size']) ?>" placeholder="Talla M"><input name="variant_sku[]" value="<?= escape((string) $variant['sku']) ?>" placeholder="SKU opcional"><input name="variant_stock[]" value="<?= escape((string) $variant['stock']) ?>" inputmode="numeric" placeholder="Cantidad"></div>
+            <div class="variant-row"><input type="hidden" name="variant_id[]" value="<?= escape((string) ($variant['id'] ?? '')) ?>"><input name="variant_size[]" value="<?= escape((string) ($variant['size'] ?? '')) ?>" placeholder="Talla M"><input name="variant_sku[]" value="<?= escape((string) ($variant['sku'] ?? '')) ?>" placeholder="SKU opcional"><input name="variant_stock[]" value="<?= escape((string) ($variant['stock'] ?? '')) ?>" inputmode="numeric" placeholder="Cantidad"></div>
           <?php endfor; ?>
           <div class="actions"><button class="approve" type="submit">Guardar producto</button><?php if ($editProduct): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
@@ -1429,15 +1575,32 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
           <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_user"><input type="hidden" name="view" value="users"><input type="hidden" name="user_id" value="<?= escape((string) $formUser['id']) ?>">
           <h2><?= $editUser ? 'Editar usuario' : 'Crear usuario' ?></h2>
           <p class="muted">La ciudad y la tienda definen qué puede ver y operar cada usuario. Vendedor y gerente de ciudad deben tener ambas asignadas.</p>
-          <div class="fields"><label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label><label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label><label><span>Rol</span><select name="role"><?php foreach (ROLES as $role): ?><option value="<?= escape($role) ?>" <?= $formUser['role'] === $role ? 'selected' : '' ?>><?= escape(roleLabel($role)) ?></option><?php endforeach; ?></select></label><label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label><label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label></div>
+          <div class="fields"><label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label><label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label><label><span>Roles</span><select name="role_codes[]" multiple size="6" required><?php foreach ($availableRoles as $role): ?><option value="<?= escape($role['code']) ?>" <?= in_array($role['code'], $formRoleCodes, true) ? 'selected' : '' ?>><?= escape($role['name'] . ' · ' . scopeLabel($role['scope_level'])) ?></option><?php endforeach; ?></select><small class="muted">Puedes combinar varios roles; sus permisos se acumulan y se aplica el alcance más amplio.</small></label><label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label><label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label></div>
           <label><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select><small class="muted">Para gerente de ciudad y vendedor es obligatorio.</small></label>
           <label><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select><small class="muted">Obligatorio para vendedor, proveedor, despachador y gerente.</small></label>
           <div class="actions"><button class="primary" type="submit">Guardar usuario</button><?php if ($editUser): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'users')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
-        <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape(roleLabel($listedUser['role'])) ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
+        <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Roles</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape($listedUser['role_names_text'] ?: 'Sin rol') ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
     <?php elseif ($view === 'inventory' && can($user, 'inventory.view')): ?>
       <section class="grid">
+        <?php if (can($user, 'inventory.restock')): ?>
+          <form class="panel stacked" method="post" action="<?= escape($basePath) ?>">
+            <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+            <input type="hidden" name="action" value="restock_inventory">
+            <input type="hidden" name="view" value="inventory">
+            <h2>Alimentar inventario</h2>
+            <p class="muted">Añade unidades a un producto existente de una tienda asignada. La entrada queda registrada con tu usuario y no permite reducir cantidades.</p>
+            <?php if ($restockVariants === []): ?>
+              <div class="empty">No hay productos activos disponibles en tus tiendas.</div>
+            <?php else: ?>
+              <label><span>Producto y variante</span><select name="variant_id" required><?php foreach ($restockVariants as $variant): ?><option value="<?= (int) $variant['variant_id'] ?>"><?= escape($variant['city_name'] . ' · ' . $variant['store_name'] . ' · ' . $variant['name'] . ' · talla ' . $variant['size'] . ' · stock actual ' . $variant['stock']) ?></option><?php endforeach; ?></select></label>
+              <label><span>Unidades recibidas</span><input name="quantity" type="number" min="1" step="1" required></label>
+              <label><span>Notas</span><input name="notes" maxlength="500" placeholder="Factura, lote o referencia de entrega"></label>
+              <button class="approve" type="submit">Registrar entrada</button>
+            <?php endif; ?>
+          </form>
+        <?php endif; ?>
         <div class="panel">
           <h2>Inventario por tienda</h2>
           <p class="muted">Cada tienda tiene su propio inventario. Las ventas descuentan la variante de la tienda asociada al producto vendido.</p>

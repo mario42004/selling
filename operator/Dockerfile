@@ -2,6 +2,7 @@ FROM php:8.4-apache
 
 RUN docker-php-ext-install pdo_mysql
 
+COPY php-production.ini /usr/local/etc/php/conf.d/zz-production.ini
 COPY public/ /var/www/html/
 
 RUN mkdir -p /var/www/html/uploads

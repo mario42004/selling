@@ -70,6 +70,7 @@ jobs:
           docker compose --env-file .env.production -f compose.prod.yaml pull mariadb n8n
           docker compose --env-file .env.production -f compose.prod.yaml build --pull operator
           docker compose --env-file .env.production -f compose.prod.yaml up -d --remove-orphans
+          sh scripts/apply-migrations.sh
           sh scripts/bootstrap-production.sh
           docker compose --env-file .env.production -f compose.prod.yaml ps
           REMOTE_SCRIPT

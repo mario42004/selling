@@ -70,6 +70,14 @@ jobs:
           docker compose --env-file .env.example -f compose.yaml logs
           exit 1
 
+      - name: Apply database migrations
+        run: |
+          for migration in db/migrations/*.sql; do
+            docker compose --env-file .env.example -f compose.yaml exec -T mariadb \
+              sh -c 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' \
+              < "$migration"
+          done
+
       - name: Import and publish workflows
         run: |
           docker compose --env-file .env.example -f compose.yaml exec -T n8n \

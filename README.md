@@ -119,6 +119,8 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `db/migrations/002_catalog_conversations.sql`: catálogo con imágenes, variantes, conversaciones y preparación del vendedor conversacional.
 - `db/migrations/003_roles_locations.sql`: usuarios, roles, ciudades, zonas, tiendas y permisos territoriales.
 - `db/migrations/006_inventory_views_store_manager.sql`: rol gerente de tienda, vistas de inventario por tienda y ciudad, y sincronización de pedidos con la tienda del producto vendido.
+- `db/migrations/007_inventory_receipts.sql`: entradas de inventario auditadas para proveedores y gerentes dentro de su alcance.
+- `db/migrations/008_rbac.sql`: roles y permisos normalizados con relaciones muchos-a-muchos y migración automática de usuarios existentes.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -224,11 +226,26 @@ Los roles operativos no deben quedar sin tienda asignada. El vendedor, gerente
 de tienda y gerente de ciudad deben tener ciudad y tienda; proveedor y
 despachador trabajan sobre las tiendas asignadas.
 
+La autorización utiliza RBAC desde MariaDB: `users` se relaciona con `roles`
+mediante `user_roles`, y `roles` con `permissions` mediante
+`role_permissions`. Un usuario puede combinar varios roles y recibe la unión de
+sus permisos. `roles.scope_level` define si su alcance es de tienda, ciudad o
+global. `user_store_assignments` y `user_city_assignments` delimitan el
+alcance territorial de esos permisos. La columna histórica `users.role` se
+mantiene temporalmente solo para compatibilidad durante despliegues; ya no es
+la fuente de autorización.
+
 En el catálogo, cada producto se crea asociado a una tienda propietaria. El
 gerente de tienda puede crear, editar, ajustar cantidades y eliminar productos
 de sus tiendas asignadas. El gerente de ciudad tiene esas mismas facultades
 sobre las tiendas de sus ciudades y puede trasladar existencias entre ellas. El
 admin global puede operar sobre todas las tiendas.
+
+El proveedor puede crear, editar, activar, desactivar y eliminar productos,
+además de ajustar sus cantidades, exclusivamente en sus tiendas asignadas. No
+puede trasladar mercancía entre tiendas ni eliminar pedidos. Las entradas
+realizadas desde la sección Inventario registran tienda, producto, variante,
+cantidad, usuario, fecha y notas.
 
 Los gerentes de tienda y ciudad pueden cancelar pedidos dentro de su alcance,
 pero no eliminarlos del sistema. Al cancelar un pedido confirmado o despachado,
