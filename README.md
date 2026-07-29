@@ -220,11 +220,12 @@ Orden recomendado dentro del panel:
 1. Crear ciudad.
 2. Crear zona, si aplica.
 3. Crear tienda como centro de acción.
-4. Crear usuarios y asignarles ciudad y tienda.
+4. Crear usuarios y asignarles ciudad o tienda según el alcance de sus roles.
 
-Los roles operativos no deben quedar sin tienda asignada. El vendedor, gerente
-de tienda y gerente de ciudad deben tener ciudad y tienda; proveedor y
-despachador trabajan sobre las tiendas asignadas.
+Los roles con alcance de tienda no deben quedar sin tienda asignada. Vendedor,
+proveedor, despachador y gerente de tienda trabajan sobre sus tiendas. El
+gerente de ciudad solo se asigna a una o varias ciudades y obtiene acceso a
+todas las tiendas asociadas; el admin global no necesita asignación territorial.
 
 La autorización utiliza RBAC desde MariaDB: `users` se relaciona con `roles`
 mediante `user_roles`, y `roles` con `permissions` mediante

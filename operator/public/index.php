@@ -862,8 +862,18 @@ function saveUser(PDO $pdo): int
     if (count($selectedRoles) !== count($roleCodes)) {
         throw new RuntimeException('Uno o más roles no son válidos.');
     }
+    $selectedScopes = array_column($selectedRoles, 'scope_level');
+    $hasGlobalScope = in_array('GLOBAL', $selectedScopes, true);
+    $hasCityScope = in_array('CITY', $selectedScopes, true);
+    $hasStoreScope = in_array('STORE', $selectedScopes, true);
     $assignedCityIds = normalizeIds($_POST['assigned_city_ids'] ?? []);
     $assignedStoreIds = normalizeIds($_POST['assigned_store_ids'] ?? []);
+    if ($hasGlobalScope) {
+        $assignedCityIds = [];
+        $assignedStoreIds = [];
+    } elseif (!$hasStoreScope) {
+        $assignedStoreIds = [];
+    }
     if ($assignedStoreIds !== []) {
         $placeholders = implode(',', array_fill(0, count($assignedStoreIds), '?'));
         $statement = $pdo->prepare("SELECT DISTINCT city_id FROM stores WHERE id IN ({$placeholders})");
@@ -871,12 +881,10 @@ function saveUser(PDO $pdo): int
         $storeCityIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
         $assignedCityIds = array_values(array_unique(array_merge($assignedCityIds, $storeCityIds)));
     }
-    $selectedScopes = array_column($selectedRoles, 'scope_level');
-    $hasGlobalScope = in_array('GLOBAL', $selectedScopes, true);
-    if (!$hasGlobalScope && $assignedStoreIds === []) {
-        throw new RuntimeException('Los roles con alcance territorial deben tener al menos una tienda asignada.');
+    if (!$hasGlobalScope && $hasStoreScope && $assignedStoreIds === []) {
+        throw new RuntimeException('Los roles con alcance de tienda deben tener al menos una tienda asignada.');
     }
-    if (in_array('CITY', $selectedScopes, true) && $assignedCityIds === []) {
+    if (!$hasGlobalScope && $hasCityScope && $assignedCityIds === []) {
         throw new RuntimeException('Los roles con alcance de ciudad deben tener al menos una ciudad asignada.');
     }
     $isAdmin = in_array('ADMIN', $roleCodes, true);
@@ -1462,6 +1470,15 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     form.catalog,form.stacked { display:grid; gap:14px; }
     .fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     .wide { grid-column:1/-1; }
+    fieldset { min-width:0; margin:0; padding:0; border:0; }
+    fieldset legend { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:7px; font-weight:800; }
+    .role-list { display:grid; gap:7px; }
+    .role-option { display:flex; gap:10px; align-items:flex-start; border:1px solid #cfd3ca; border-radius:8px; padding:10px 11px; cursor:pointer; background:#fff; }
+    .role-option:has(input:checked) { border-color:var(--green); background:var(--green-soft); }
+    .role-option input { margin:3px 0 0; flex:0 0 auto; }
+    .role-option strong,.role-option small { display:block; }
+    .role-option small { color:var(--muted); margin-top:2px; }
+    [hidden] { display:none !important; }
     .variant-row { display:grid; grid-template-columns:1fr 1fr .8fr; gap:9px; margin-bottom:8px; }
     .empty { text-align:center; background:var(--panel); border:1px dashed #c5c8bf; border-radius:8px; padding:42px 20px; color:var(--muted); }
     table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
@@ -1574,10 +1591,16 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
         <form class="panel stacked" method="post">
           <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_user"><input type="hidden" name="view" value="users"><input type="hidden" name="user_id" value="<?= escape((string) $formUser['id']) ?>">
           <h2><?= $editUser ? 'Editar usuario' : 'Crear usuario' ?></h2>
-          <p class="muted">La ciudad y la tienda definen qué puede ver y operar cada usuario. Vendedor y gerente de ciudad deben tener ambas asignadas.</p>
-          <div class="fields"><label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label><label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label><label><span>Roles</span><select name="role_codes[]" multiple size="6" required><?php foreach ($availableRoles as $role): ?><option value="<?= escape($role['code']) ?>" <?= in_array($role['code'], $formRoleCodes, true) ? 'selected' : '' ?>><?= escape($role['name'] . ' · ' . scopeLabel($role['scope_level'])) ?></option><?php endforeach; ?></select><small class="muted">Puedes combinar varios roles; sus permisos se acumulan y se aplica el alcance más amplio.</small></label><label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label><label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label></div>
-          <label><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select><small class="muted">Para gerente de ciudad y vendedor es obligatorio.</small></label>
-          <label><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select><small class="muted">Obligatorio para vendedor, proveedor, despachador y gerente.</small></label>
+          <p class="muted">El alcance del rol determina la asignación: gerente de ciudad solo requiere ciudad; los roles de tienda requieren tienda; el admin global no requiere ninguna.</p>
+          <div class="fields">
+            <label><span>Nombre</span><input name="name" required value="<?= escape((string) $formUser['name']) ?>"></label>
+            <label><span>Email</span><input name="email" type="email" required value="<?= escape((string) $formUser['email']) ?>"></label>
+            <fieldset class="wide"><legend>Roles</legend><div class="role-list" id="user-role-list"><?php foreach ($availableRoles as $role): ?><label class="role-option"><input type="checkbox" name="role_codes[]" value="<?= escape($role['code']) ?>" data-scope="<?= escape($role['scope_level']) ?>" <?= in_array($role['code'], $formRoleCodes, true) ? 'checked' : '' ?>><div><strong><?= escape($role['name']) ?></strong><small><?= escape(scopeLabel($role['scope_level'])) ?></small></div></label><?php endforeach; ?></div><small class="muted">Escoge uno o varios roles. Sus permisos se acumulan y se aplica el alcance más amplio.</small></fieldset>
+            <label><span>Contraseña</span><input name="password" type="password" placeholder="<?= $editUser ? 'Dejar vacío para no cambiar' : '' ?>"></label>
+            <label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formUser['active'] === 1 ? 'checked' : '' ?>> Usuario activo</label>
+          </div>
+          <label id="user-city-assignments"><span>Ciudades asignadas</span><select name="assigned_city_ids[]" multiple size="4"><?php foreach ($cities as $city): ?><option value="<?= (int) $city['id'] ?>" <?= in_array((int) $city['id'], $editUserCityIds, true) ? 'selected' : '' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select><small class="muted">Obligatorio para los roles con alcance de ciudad.</small></label>
+          <label id="user-store-assignments"><span>Tiendas asignadas</span><select name="assigned_store_ids[]" multiple size="6"><?php foreach ($stores as $store): ?><option value="<?= (int) $store['id'] ?>" <?= in_array((int) $store['id'], $editUserStoreIds, true) ? 'selected' : '' ?>><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select><small class="muted">Obligatorio para vendedor, proveedor, despachador y gerente de tienda.</small></label>
           <div class="actions"><button class="primary" type="submit">Guardar usuario</button><?php if ($editUser): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'users')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
         <div class="panel"><h2>Usuarios</h2><table><thead><tr><th>Nombre</th><th>Email</th><th>Roles</th><th>Estado</th><th></th></tr></thead><tbody><?php foreach ($users as $listedUser): ?><tr><td><?= escape($listedUser['name']) ?></td><td><?= escape($listedUser['email']) ?></td><td><?= escape($listedUser['role_names_text'] ?: 'Sin rol') ?></td><td><?= (int) $listedUser['active'] === 1 ? 'Activo' : 'Inactivo' ?></td><td><a href="<?= escape(viewUrl($basePath, 'users', ['edit_user' => (int) $listedUser['id']])) ?>">Editar</a></td></tr><?php endforeach; ?></tbody></table></div>
@@ -1649,5 +1672,27 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     <?php endif; ?>
   <?php endif; ?>
 </main>
+<script>
+  (() => {
+    const roles = Array.from(document.querySelectorAll('#user-role-list input[name="role_codes[]"]'));
+    const cityGroup = document.getElementById('user-city-assignments');
+    const storeGroup = document.getElementById('user-store-assignments');
+    if (roles.length === 0 || !cityGroup || !storeGroup) return;
+
+    const updateAssignments = () => {
+      const scopes = roles.filter((role) => role.checked).map((role) => role.dataset.scope);
+      const globalScope = scopes.includes('GLOBAL');
+      const needsCity = !globalScope && scopes.includes('CITY');
+      const needsStore = !globalScope && scopes.includes('STORE');
+      cityGroup.hidden = !needsCity;
+      storeGroup.hidden = !needsStore;
+      cityGroup.querySelector('select').disabled = !needsCity;
+      storeGroup.querySelector('select').disabled = !needsStore;
+    };
+
+    roles.forEach((role) => role.addEventListener('change', updateAssignments));
+    updateAssignments();
+  })();
+</script>
 </body>
 </html>
