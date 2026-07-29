@@ -123,6 +123,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `db/migrations/008_rbac.sql`: roles y permisos normalizados con relaciones muchos-a-muchos y migración automática de usuarios existentes.
 - `db/migrations/009_supplier_vat_catalog_pricing.sql`: coste neto del proveedor, IVA separado, total con IVA y permisos independientes para fijar precios de venta.
 - `db/migrations/010_audit_reporting.sql`: bitácora inmutable, libro de movimientos de inventario y permisos para reportes territoriales.
+- `db/migrations/011_sales_dispatch_documents.sql`: separación entre aprobación de pagos y despacho, bandeja diaria y documentos PDF de entrega.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -262,6 +263,16 @@ pero no eliminarlos del sistema. Al cancelar un pedido confirmado o despachado,
 sus unidades vuelven al inventario. Solamente el admin global puede eliminar un
 pedido definitivamente; el borrado elimina sus artículos y eventos y también
 restaura el stock cuando corresponde.
+
+El vendedor y los gerentes de tienda o ciudad pueden confirmar o rechazar pagos
+dentro de su alcance; el admin global puede hacerlo en todo el sistema. El
+despachador no participa en la aprobación: su única bandeja operativa muestra
+las ventas confirmadas del día para sus tiendas. Desde allí genera una ficha
+diaria consolidada en PDF, una guía de entrega PDF independiente por pedido y
+registra cuándo cada paquete se entrega al repartidor. El gerente de tienda
+conserva todas estas facultades operativas sobre su tienda, además del control
+de catálogo, precios, inventario, cancelaciones, estadísticas y reportes, pero
+no puede eliminar pedidos definitivamente.
 
 El inventario se maneja por tienda, producto y talla. Cuando se aprueba una
 venta, MariaDB vuelve a validar el stock y descuenta únicamente la variante de

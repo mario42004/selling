@@ -173,6 +173,129 @@ function downloadXlsx(array $sheets, string $filename): never
     exit;
 }
 
+function pdfEncodedText(string $value): string
+{
+    $value = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/u', '', $value) ?? '';
+    $encoded = iconv('UTF-8', 'Windows-1252//TRANSLIT//IGNORE', $value);
+    return str_replace(['\\', '(', ')'], ['\\\\', '\\(', '\\)'], $encoded === false ? $value : $encoded);
+}
+
+function wrappedPdfLines(string $value, int $width = 88): array
+{
+    $value = trim(preg_replace('/\s+/u', ' ', $value) ?? '');
+    if ($value === '') {
+        return [''];
+    }
+    return explode("\n", wordwrap($value, $width, "\n", true));
+}
+
+function pdfDocument(array $lines): string
+{
+    $pages = array_chunk($lines === [] ? ['Sin datos'] : $lines, 52);
+    $pageCount = count($pages);
+    $fontId = 3 + ($pageCount * 2);
+    $objects = [];
+    $objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+    $kids = [];
+    foreach ($pages as $index => $pageLines) {
+        $pageId = 3 + ($index * 2);
+        $contentId = $pageId + 1;
+        $kids[] = "{$pageId} 0 R";
+        $content = "BT\n/F1 10 Tf\n42 800 Td\n14 TL\n";
+        foreach ($pageLines as $line) {
+            $content .= '(' . pdfEncodedText((string) $line) . ") Tj\nT*\n";
+        }
+        $content .= "ET\n";
+        $objects[$pageId] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {$fontId} 0 R >> >> /Contents {$contentId} 0 R >>";
+        $objects[$contentId] = '<< /Length ' . strlen($content) . ">>\nstream\n{$content}endstream";
+    }
+    $objects[2] = '<< /Type /Pages /Kids [' . implode(' ', $kids) . '] /Count ' . $pageCount . ' >>';
+    $objects[$fontId] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>';
+    ksort($objects);
+
+    $pdf = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
+    $offsets = [0];
+    foreach ($objects as $id => $object) {
+        $offsets[$id] = strlen($pdf);
+        $pdf .= "{$id} 0 obj\n{$object}\nendobj\n";
+    }
+    $xref = strlen($pdf);
+    $pdf .= 'xref' . "\n0 " . (count($objects) + 1) . "\n0000000000 65535 f \n";
+    for ($id = 1; $id <= count($objects); $id++) {
+        $pdf .= sprintf("%010d 00000 n \n", $offsets[$id]);
+    }
+    $pdf .= 'trailer' . "\n<< /Size " . (count($objects) + 1) . " /Root 1 0 R >>\nstartxref\n{$xref}\n%%EOF\n";
+    return $pdf;
+}
+
+function downloadPdf(array $lines, string $filename): never
+{
+    $pdf = pdfDocument($lines);
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-zA-Z0-9._-]/', '-', $filename) . '"');
+    header('Content-Length: ' . strlen($pdf));
+    echo $pdf;
+    exit;
+}
+
+function deliveryManifestLines(array $shipments, string $date): array
+{
+    $total = array_sum(array_map(static fn (array $row): float => (float) $row['total'], $shipments));
+    $lines = [
+        'FICHA DIARIA DE ENTREGA A REPARTO',
+        'Fecha de ventas: ' . $date,
+        'Generada: ' . (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+        'Pedidos: ' . count($shipments) . '  |  Valor total: ' . moneyExact($total),
+        str_repeat('-', 72),
+    ];
+    foreach ($shipments as $shipment) {
+        $lines[] = 'Pedido #' . $shipment['order_id'] . ' | ' . $shipment['store_name'] . ' | ' . statusLabel((string) $shipment['status']);
+        foreach (wrappedPdfLines('Cliente: ' . $shipment['customer_name'] . ' | Tel: ' . $shipment['phone']) as $line) $lines[] = $line;
+        foreach (wrappedPdfLines('Entrega: ' . $shipment['delivery_address']) as $line) $lines[] = $line;
+        foreach (preg_split('/\R/u', (string) $shipment['items']) ?: [] as $item) {
+            foreach (wrappedPdfLines('  - ' . $item) as $line) $lines[] = $line;
+        }
+        $lines[] = 'Total: ' . moneyExact($shipment['total']);
+        $lines[] = str_repeat('-', 72);
+    }
+    $lines[] = '';
+    $lines[] = 'Entregado por: ____________________  Recibido por repartidor: ____________________';
+    $lines[] = 'Hora: __________  Firma: ______________________________';
+    return $lines;
+}
+
+function deliveryGuideLines(array $shipment): array
+{
+    $lines = [
+        'GUÍA DE ENTREGA',
+        'Pedido #' . $shipment['order_id'],
+        'Fecha de venta: ' . substr((string) $shipment['payment_confirmed_at'], 0, 10),
+        'Tienda: ' . $shipment['store_name'],
+        'Origen: ' . trim(($shipment['store_address'] ?? '') . ' | ' . ($shipment['store_phone'] ?? ''), ' |'),
+        'Ciudad / zona: ' . trim(($shipment['city_name'] ?? '') . ' / ' . ($shipment['zone_name'] ?? ''), ' /'),
+        str_repeat('-', 72),
+        'DESTINATARIO',
+        'Cliente: ' . $shipment['customer_name'],
+        'Teléfono: ' . $shipment['phone'],
+    ];
+    foreach (wrappedPdfLines('Dirección: ' . $shipment['delivery_address']) as $line) $lines[] = $line;
+    if (trim((string) ($shipment['delivery_notes'] ?? '')) !== '') {
+        foreach (wrappedPdfLines('Notas: ' . $shipment['delivery_notes']) as $line) $lines[] = $line;
+    }
+    $lines[] = str_repeat('-', 72);
+    $lines[] = 'CONTENIDO';
+    foreach (preg_split('/\R/u', (string) $shipment['items']) ?: [] as $item) {
+        foreach (wrappedPdfLines('- ' . $item) as $line) $lines[] = $line;
+    }
+    $lines[] = '';
+    $lines[] = 'Valor del pedido: ' . moneyExact($shipment['total']);
+    $lines[] = str_repeat('-', 72);
+    $lines[] = 'Recibido por: __________________________________________';
+    $lines[] = 'Documento: __________________  Fecha/hora: __________________';
+    $lines[] = 'Firma: __________________________________________________';
+    return $lines;
+}
+
 function escape(?string $value): string
 {
     return htmlspecialchars($value ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -1251,6 +1374,38 @@ function reportWorkbook(array $report, string $from, string $to): array
     return ['Resumen'=>$summary,'Ventas'=>$sales,'Productos vendidos'=>$products,'Inventario'=>$inventory,'Movimientos'=>$movements];
 }
 
+function loadDailyShipments(PDO $pdo, array $user, string $date): array
+{
+    $params = [];
+    $where = [
+        scopedWhere($pdo, $user, 'o', $params),
+        "o.status IN ('CONFIRMED','DISPATCHED')",
+        'o.payment_confirmed_at >= ?',
+        'o.payment_confirmed_at < DATE_ADD(?, INTERVAL 1 DAY)',
+    ];
+    $params[] = $date;
+    $params[] = $date;
+    $statement = $pdo->prepare(
+        "SELECT o.id AS order_id,o.status,o.customer_name,o.phone,o.delivery_address,o.delivery_notes,
+                o.total,o.payment_confirmed_at,o.logistics_notified_at,s.name AS store_name,
+                s.address AS store_address,s.phone AS store_phone,c.name AS city_name,z.name AS zone_name,
+                GROUP_CONCAT(CONCAT(oi.quantity,' x ',oi.product_name,
+                  IF(oi.size IS NULL OR oi.size='', '', CONCAT(' talla ',oi.size)))
+                  ORDER BY oi.id SEPARATOR '\n') AS items
+         FROM orders o
+         JOIN order_items oi ON oi.order_id=o.id
+         LEFT JOIN stores s ON s.id=o.store_id
+         LEFT JOIN cities c ON c.id=o.city_id
+         LEFT JOIN zones z ON z.id=o.zone_id
+         WHERE " . implode(' AND ', $where) . "
+         GROUP BY o.id,o.status,o.customer_name,o.phone,o.delivery_address,o.delivery_notes,o.total,
+                  o.payment_confirmed_at,o.logistics_notified_at,s.name,s.address,s.phone,c.name,z.name
+         ORDER BY s.name,o.payment_confirmed_at,o.id"
+    );
+    $statement->execute($params);
+    return $statement->fetchAll();
+}
+
 $pdo = null;
 $databaseError = null;
 try {
@@ -1426,8 +1581,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
         if ($orderId === false || !in_array($action, ['approve', 'reject', 'dispatch'], true)) {
             throw new RuntimeException('Acción no válida.');
         }
-        if (!can($user, 'orders.approve')) {
-            throw new RuntimeException('No tienes permiso para gestionar pedidos.');
+        $requiredPermission = $action === 'dispatch' ? 'shipments.dispatch' : 'orders.approve';
+        if (!can($user, $requiredPermission)) {
+            throw new RuntimeException($action === 'dispatch'
+                ? 'No tienes permiso para entregar pedidos a reparto.'
+                : 'No tienes permiso para aprobar o rechazar pagos.');
         }
         assertOrderAccess($pdo, $user, (int) $orderId);
 
@@ -1464,12 +1622,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
                 throw new RuntimeException("Solo se puede despachar un pedido confirmado; ahora está {$currentStatus}");
             }
             $pdo->prepare("UPDATE orders SET status = 'DISPATCHED', logistics_notified_at = NOW(), dispatched_by_user_id = ? WHERE id = ?")->execute([(int) $user['id'], (int) $orderId]);
-            $eventType = 'ORDER_DISPATCHED';
-            $message = "Pedido #{$orderId} marcado como despachado.";
+            $eventType = 'ORDER_HANDED_TO_COURIER';
+            $message = "Pedido #{$orderId} entregado al repartidor.";
         }
         $pdo->prepare('INSERT INTO order_events (order_id, event_type, actor, details) VALUES (?, ?, ?, ?)')
             ->execute([(int) $orderId, $eventType, (string) $user['email'], json_encode(['source' => 'sales-backoffice'], JSON_THROW_ON_ERROR)]);
         $pdo->commit();
+        if ($action === 'dispatch') {
+            $shipmentDate = validReportDate((string) ($_POST['shipment_date'] ?? ''), (new DateTimeImmutable('today'))->format('Y-m-d'));
+            redirectWithFlash($basePath, $message, 'success', 'shipments', ['date' => $shipmentDate]);
+        }
         redirectWithFlash($basePath, $message, 'success', 'orders', ['status' => $selectedStatus]);
     } catch (Throwable $error) {
         if ($pdo->inTransaction()) {
@@ -1485,6 +1647,7 @@ $reportData = $auditRows = $auditActions = $auditEntities = $auditActors = [];
 $auditAction = $auditEntity = $auditOperation = '';
 $auditActorId = 0;
 $today = (new DateTimeImmutable('today'))->format('Y-m-d');
+$shipmentDate = validReportDate((string) ($_GET['date'] ?? ''), $today);
 $reportFrom = validReportDate((string) ($_GET['from'] ?? ''), (new DateTimeImmutable('first day of this month'))->format('Y-m-d'));
 $reportTo = validReportDate((string) ($_GET['to'] ?? ''), $today);
 if ($reportFrom > $reportTo) [$reportFrom, $reportTo] = [$reportTo, $reportFrom];
@@ -1680,20 +1843,31 @@ if ($pdo instanceof PDO && $user !== null) {
     }
 
     if (can($user, 'shipments.view')) {
-        $params = [];
-        $where = scopedWhere($pdo, $user, 'o', $params);
-        $statement = $pdo->prepare(
-            "SELECT o.id AS order_id, o.customer_name, o.phone, o.delivery_address, o.delivery_notes, o.total, o.payment_confirmed_at, s.name AS store_name,
-              GROUP_CONCAT(CONCAT(oi.quantity, ' x ', oi.product_name, IF(oi.size IS NULL OR oi.size = '', '', CONCAT(' talla ', oi.size))) ORDER BY oi.id SEPARATOR '\n') AS items
-             FROM orders o
-             JOIN order_items oi ON oi.order_id = o.id
-             LEFT JOIN stores s ON s.id = o.store_id
-             WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}
-             GROUP BY o.id, o.customer_name, o.phone, o.delivery_address, o.delivery_notes, o.total, o.payment_confirmed_at, s.name
-             ORDER BY o.payment_confirmed_at DESC, o.id DESC LIMIT 200"
-        );
-        $statement->execute($params);
-        $shipments = $statement->fetchAll();
+        $shipments = loadDailyShipments($pdo, $user, $shipmentDate);
+        $shipmentDownload = $view === 'shipments' ? (string) ($_GET['download'] ?? '') : '';
+        if ($shipmentDownload !== '') {
+            if (!can($user, 'shipments.export')) {
+                throw new RuntimeException('No tienes permiso para generar documentos de entrega.');
+            }
+            if ($shipmentDownload === 'manifest') {
+                downloadPdf(deliveryManifestLines($shipments, $shipmentDate), "ficha-entrega-{$shipmentDate}.pdf");
+            }
+            if ($shipmentDownload === 'guide') {
+                $guideOrderId = max(0, (int) ($_GET['order_id'] ?? 0));
+                $guide = null;
+                foreach ($shipments as $shipment) {
+                    if ((int) $shipment['order_id'] === $guideOrderId) {
+                        $guide = $shipment;
+                        break;
+                    }
+                }
+                if (!is_array($guide)) {
+                    throw new RuntimeException('La guía solicitada no pertenece al día o al alcance permitido.');
+                }
+                downloadPdf(deliveryGuideLines($guide), "guia-entrega-pedido-{$guideOrderId}.pdf");
+            }
+            throw new RuntimeException('Documento de entrega no válido.');
+        }
     }
 
     if (can($user, 'stats.view')) {
@@ -2063,8 +2237,15 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
         <div class="summary"><div class="metric"><span>Ventas</span><strong>$<?= money($stats['summary']['sales_total'] ?? 0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int) ($stats['summary']['orders_count'] ?? 0) ?></strong></div><div class="metric"><span>Ticket promedio</span><strong>$<?= money($stats['summary']['average_ticket'] ?? 0) ?></strong></div><div class="metric"><span>Unidades en inventario</span><strong><?= (int) ($stats['inventory']['stock_units'] ?? 0) ?></strong></div><div class="metric"><span>Productos activos</span><strong><?= (int) ($stats['inventory']['products_count'] ?? 0) ?></strong></div><div class="metric"><span>Tiendas visibles</span><strong><?= (int) ($stats['inventory']['stores_count'] ?? 0) ?></strong></div></div>
         <div class="panel"><h2>Ventas por tienda</h2><table><thead><tr><th>Tienda</th><th>Pedidos</th><th>Ventas</th></tr></thead><tbody><?php foreach (($stats['stores'] ?? []) as $row): ?><tr><td><?= escape($row['store_name'] ?? 'Sin tienda') ?></td><td><?= (int) $row['orders_count'] ?></td><td>$<?= money($row['sales_total']) ?></td></tr><?php endforeach; ?></tbody></table></div>
       </section>
-    <?php elseif ($view === 'shipments'): ?>
-      <?php if ($shipments === []): ?><div class="empty">No hay envíos visibles para tu rol.</div><?php else: ?><table><thead><tr><th>Pedido</th><th>Tienda</th><th>Cliente</th><th>Dirección</th><th>Productos</th><th>Total</th></tr></thead><tbody><?php foreach ($shipments as $shipment): ?><tr><td>#<?= (int) $shipment['order_id'] ?></td><td><?= escape($shipment['store_name']) ?></td><td><?= escape($shipment['customer_name']) ?><br><span class="muted"><?= escape($shipment['phone']) ?></span></td><td><?= escape($shipment['delivery_address']) ?><?php if ($shipment['delivery_notes']): ?><br><span class="muted"><?= escape($shipment['delivery_notes']) ?></span><?php endif; ?></td><td><?= nl2br(escape($shipment['items'])) ?></td><td>$<?= money($shipment['total']) ?></td></tr><?php endforeach; ?></tbody></table><?php endif; ?>
+    <?php elseif ($view === 'shipments' && can($user, 'shipments.view')): ?>
+      <form class="panel filter-form" method="get" action="<?= escape($basePath) ?>">
+        <input type="hidden" name="view" value="shipments">
+        <label><span>Día de ventas</span><input type="date" name="date" value="<?= escape($shipmentDate) ?>" required></label>
+        <button class="primary" type="submit">Ver entregas</button>
+        <?php if (can($user, 'shipments.export')): ?><a class="button secondary" href="<?= escape(viewUrl($basePath, 'shipments', ['date' => $shipmentDate, 'download' => 'manifest'])) ?>">Ficha diaria PDF</a><?php endif; ?>
+      </form>
+      <p class="muted" style="margin-bottom:12px">Ventas confirmadas el <?= escape($shipmentDate) ?>. El despachador prepara los paquetes, genera las guías y registra la entrega al repartidor.</p>
+      <?php if ($shipments === []): ?><div class="empty">No hay ventas confirmadas para este día dentro de tus tiendas.</div><?php else: ?><table><thead><tr><th>Pedido</th><th>Tienda</th><th>Cliente</th><th>Dirección</th><th>Productos</th><th>Total</th><th>Entrega</th></tr></thead><tbody><?php foreach ($shipments as $shipment): ?><tr><td>#<?= (int) $shipment['order_id'] ?><br><span class="badge <?= escape($shipment['status']) ?>"><?= escape(statusLabel($shipment['status'])) ?></span></td><td><?= escape($shipment['store_name']) ?></td><td><?= escape($shipment['customer_name']) ?><br><span class="muted"><?= escape($shipment['phone']) ?></span></td><td><?= escape($shipment['delivery_address']) ?><?php if ($shipment['delivery_notes']): ?><br><span class="muted"><?= escape($shipment['delivery_notes']) ?></span><?php endif; ?></td><td><?= nl2br(escape($shipment['items'])) ?></td><td><?= moneyExact($shipment['total']) ?></td><td><div class="actions"><?php if (can($user, 'shipments.export')): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'shipments', ['date' => $shipmentDate, 'download' => 'guide', 'order_id' => (int) $shipment['order_id']])) ?>">Guía PDF</a><?php endif; ?><?php if (can($user, 'shipments.dispatch') && $shipment['status'] === 'CONFIRMED'): ?><form method="post" action="<?= escape($basePath) ?>"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="view" value="shipments"><input type="hidden" name="order_id" value="<?= (int) $shipment['order_id'] ?>"><input type="hidden" name="shipment_date" value="<?= escape($shipmentDate) ?>"><button class="dispatch" type="submit">Entregado al repartidor</button></form><?php elseif ($shipment['status'] === 'DISPATCHED'): ?><span class="muted">Entregado <?= escape((string) $shipment['logistics_notified_at']) ?></span><?php endif; ?></div></td></tr><?php endforeach; ?></tbody></table><?php endif; ?>
     <?php else: ?>
       <?php if (!can($user, 'orders.view')): ?><div class="empty">Tu rol no tiene bandeja de pedidos.</div><?php else: ?>
       <nav class="summary"><a class="metric <?= $selectedStatus === 'ALL' ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders')) ?>"><span>Todos</span><strong><?= $totalOrders ?></strong></a><?php foreach ($counts as $status => $count): ?><a class="metric <?= $selectedStatus === $status ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, 'orders', ['status' => $status])) ?>"><span><?= escape(statusLabel($status)) ?></span><strong><?= $count ?></strong></a><?php endforeach; ?></nav>
@@ -2077,8 +2258,8 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
               <?php if (can($user, 'orders.approve') && $order['status'] === 'PENDING_PAYMENT'): ?>
                 <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form>
                 <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form>
-              <?php elseif (can($user, 'orders.approve') && $order['status'] === 'CONFIRMED'): ?>
-                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form>
+              <?php elseif (can($user, 'shipments.dispatch') && $order['status'] === 'CONFIRMED'): ?>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><input type="hidden" name="shipment_date" value="<?= escape($today) ?>"><button class="dispatch" type="submit">Entregar al repartidor</button></form>
               <?php endif; ?>
               <?php if (can($user, 'orders.cancel') && in_array($order['status'], ['PENDING_PAYMENT', 'CONFIRMED', 'DISPATCHED'], true)): ?>
                 <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="cancel_order"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="neutral" type="submit">Cancelar pedido</button></form>
