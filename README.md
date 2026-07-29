@@ -122,6 +122,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `db/migrations/007_inventory_receipts.sql`: entradas de inventario auditadas para proveedores y gerentes dentro de su alcance.
 - `db/migrations/008_rbac.sql`: roles y permisos normalizados con relaciones muchos-a-muchos y migración automática de usuarios existentes.
 - `db/migrations/009_supplier_vat_catalog_pricing.sql`: coste neto del proveedor, IVA separado, total con IVA y permisos independientes para fijar precios de venta.
+- `db/migrations/010_audit_reporting.sql`: bitácora inmutable, libro de movimientos de inventario y permisos para reportes territoriales.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -267,6 +268,22 @@ venta, MariaDB vuelve a validar el stock y descuenta únicamente la variante de
 la tienda asociada al producto vendido. El inventario de ciudad se calcula como
 la suma de las tiendas visibles dentro de esa ciudad: admin ve todo, gerente de
 ciudad ve su alcance geográfico y gerente de tienda ve sus tiendas asignadas.
+
+La sección **Reportes** forma parte de Operator. El admin global obtiene datos
+de todo el sistema; los gerentes de ciudad y tienda solo reciben ventas,
+inventario y movimientos dentro de sus asignaciones. El periodo puede filtrarse
+por fechas y, cuando el alcance lo permite, por ciudad y tienda. La exportación
+genera un archivo Excel `.xlsx` con las hojas Resumen, Ventas, Productos
+vendidos, Inventario y Movimientos.
+
+La trazabilidad utiliza una entrada separada en
+`https://DOMINIO_CONFIGURADO/operator/traceability.php` y es exclusiva del
+admin global. Registra autenticaciones y cambios sobre usuarios, RBAC,
+ubicaciones, catálogo, precios, inventario, pedidos y conversaciones, junto con
+el usuario, roles, IP, origen, fecha y valores anteriores/posteriores. Puede
+filtrarse por periodo, operación, acción, entidad, usuario, ciudad y tienda. Los
+triggers de MariaDB impiden modificar o borrar entradas de `audit_log`; esta
+migración no reconstruye cambios anteriores a su instalación.
 
 Prepara la autenticación adicional de Nginx:
 

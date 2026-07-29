@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 header('Content-Type: text/html; charset=utf-8');
 header('Cache-Control: no-store');
-header("Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'unsafe-inline'; script-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'unsafe-inline'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
 header('Referrer-Policy: no-referrer');
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
@@ -57,6 +57,120 @@ function database(): PDO
         ]
     );
     return $pdo;
+}
+
+function setAuditContext(PDO $pdo, ?array $user, string $action = 'REQUEST', ?string $movementType = null, ?string $movementNotes = null): void
+{
+    $roles = $user === null ? null : implode(',', $user['role_codes'] ?? []);
+    $statement = $pdo->prepare(
+        'SET @audit_request_id = ?, @audit_actor_user_id = ?, @audit_actor_email = ?, @audit_actor_name = ?,
+             @audit_actor_roles = ?, @audit_source = ?, @audit_ip = ?, @audit_action = ?,
+             @inventory_movement_type = ?, @inventory_notes = ?'
+    );
+    $statement->execute([
+        bin2hex(random_bytes(16)),
+        $user['id'] ?? null,
+        $user['email'] ?? null,
+        $user['name'] ?? null,
+        $roles,
+        'operator',
+        substr((string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? ''), 0, 64) ?: null,
+        strtoupper(substr($action, 0, 100)),
+        $movementType,
+        $movementNotes === null ? null : substr(trim($movementNotes), 0, 500),
+    ]);
+}
+
+function recordAuthAudit(PDO $pdo, string $action, ?array $user, ?string $email = null): void
+{
+    try {
+        setAuditContext($pdo, $user, $action);
+        $statement = $pdo->prepare(
+            "INSERT INTO audit_log (request_id, operation, action_name, entity_type, entity_id, actor_user_id,
+              actor_email, actor_name, actor_roles, source, ip_address, after_data)
+             VALUES (@audit_request_id, 'AUTH', ?, 'session', ?, @audit_actor_user_id,
+              COALESCE(@audit_actor_email, ?), @audit_actor_name, @audit_actor_roles, 'operator', @audit_ip,
+              JSON_OBJECT('successful', ?))"
+        );
+        $statement->execute([$action, isset($user['id']) ? (string) $user['id'] : null, $email, $action === 'LOGIN_SUCCESS' ? 1 : 0]);
+    } catch (PDOException $error) {
+        if (!str_contains($error->getMessage(), 'audit_log')) {
+            throw $error;
+        }
+    }
+}
+
+function xmlValue(string $value): string
+{
+    return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+}
+
+function xlsxColumn(int $index): string
+{
+    $name = '';
+    while ($index >= 0) {
+        $name = chr(65 + ($index % 26)) . $name;
+        $index = intdiv($index, 26) - 1;
+    }
+    return $name;
+}
+
+function xlsxSheet(array $rows): string
+{
+    $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+    $xml .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
+    foreach (array_values($rows) as $rowIndex => $row) {
+        $excelRow = $rowIndex + 1;
+        $xml .= '<row r="' . $excelRow . '">';
+        foreach (array_values($row) as $columnIndex => $value) {
+            $reference = xlsxColumn($columnIndex) . $excelRow;
+            $style = $rowIndex === 0 ? ' s="1"' : '';
+            $xml .= '<c r="' . $reference . '" t="inlineStr"' . $style . '><is><t>' . xmlValue((string) ($value ?? '')) . '</t></is></c>';
+        }
+        $xml .= '</row>';
+    }
+    return $xml . '</sheetData></worksheet>';
+}
+
+function downloadXlsx(array $sheets, string $filename): never
+{
+    if (!class_exists(ZipArchive::class)) {
+        throw new RuntimeException('La exportación Excel no está disponible en este servidor.');
+    }
+    $temporary = tempnam(sys_get_temp_dir(), 'operator-report-');
+    if ($temporary === false) {
+        throw new RuntimeException('No se pudo preparar el archivo Excel.');
+    }
+    $zip = new ZipArchive();
+    if ($zip->open($temporary, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        throw new RuntimeException('No se pudo crear el archivo Excel.');
+    }
+    $sheetNames = array_keys($sheets);
+    $contentTypes = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
+    $workbook = '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>';
+    $relationships = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
+    foreach ($sheetNames as $index => $sheetName) {
+        $sheetId = $index + 1;
+        $contentTypes .= '<Override PartName="/xl/worksheets/sheet' . $sheetId . '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+        $workbook .= '<sheet name="' . xmlValue(substr($sheetName, 0, 31)) . '" sheetId="' . $sheetId . '" r:id="rId' . $sheetId . '"/>';
+        $relationships .= '<Relationship Id="rId' . $sheetId . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' . $sheetId . '.xml"/>';
+        $zip->addFromString('xl/worksheets/sheet' . $sheetId . '.xml', xlsxSheet($sheets[$sheetName]));
+    }
+    $relationships .= '<Relationship Id="rId' . (count($sheetNames) + 1) . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+    $workbook .= '</sheets></workbook>';
+    $contentTypes .= '</Types>';
+    $zip->addFromString('[Content_Types].xml', $contentTypes);
+    $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+    $zip->addFromString('xl/workbook.xml', $workbook);
+    $zip->addFromString('xl/_rels/workbook.xml.rels', $relationships);
+    $zip->addFromString('xl/styles.xml', '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font/><font><b/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf xfId="0"/><xf xfId="0" fontId="1" applyFont="1"/></cellXfs></styleSheet>');
+    $zip->close();
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-zA-Z0-9._-]/', '-', $filename) . '"');
+    header('Content-Length: ' . filesize($temporary));
+    readfile($temporary);
+    unlink($temporary);
+    exit;
 }
 
 function escape(?string $value): string
@@ -1026,10 +1140,122 @@ function assertOrderAccess(PDO $pdo, array $user, int $orderId): void
     }
 }
 
+function validReportDate(string $value, string $fallback): string
+{
+    $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    return $date !== false && $date->format('Y-m-d') === $value ? $value : $fallback;
+}
+
+function reportWhere(PDO $pdo, array $user, string $alias, string $dateColumn, string $from, string $to, int $cityId, int $storeId, array &$params): string
+{
+    $where = [scopedWhere($pdo, $user, $alias, $params), "{$dateColumn} >= ?", "{$dateColumn} < DATE_ADD(?, INTERVAL 1 DAY)"];
+    $params[] = $from;
+    $params[] = $to;
+    if ($cityId > 0) {
+        $where[] = "{$alias}.city_id = ?";
+        $params[] = $cityId;
+    }
+    if ($storeId > 0) {
+        $where[] = "{$alias}.store_id = ?";
+        $params[] = $storeId;
+    }
+    return implode(' AND ', $where);
+}
+
+function loadReportData(PDO $pdo, array $user, string $from, string $to, int $cityId, int $storeId): array
+{
+    $params = [];
+    $where = reportWhere($pdo, $user, 'o', 'o.payment_confirmed_at', $from, $to, $cityId, $storeId, $params);
+    $statement = $pdo->prepare(
+        "SELECT o.id, o.payment_confirmed_at, c.name AS city_name, z.name AS zone_name, s.name AS store_name,
+                o.customer_name, o.phone, o.status, o.total, u.name AS reviewer_name
+         FROM orders o
+         LEFT JOIN cities c ON c.id=o.city_id LEFT JOIN zones z ON z.id=o.zone_id
+         LEFT JOIN stores s ON s.id=o.store_id LEFT JOIN users u ON u.id=o.payment_reviewed_by_user_id
+         WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}
+         ORDER BY o.payment_confirmed_at, o.id"
+    );
+    $statement->execute($params);
+    $sales = $statement->fetchAll();
+
+    $params = [];
+    $where = reportWhere($pdo, $user, 'o', 'o.payment_confirmed_at', $from, $to, $cityId, $storeId, $params);
+    $statement = $pdo->prepare(
+        "SELECT c.name AS city_name, s.name AS store_name, oi.sku, oi.product_name, oi.size,
+                SUM(oi.quantity) AS units, SUM(oi.quantity*oi.unit_price) AS revenue
+         FROM order_items oi JOIN orders o ON o.id=oi.order_id
+         LEFT JOIN cities c ON c.id=o.city_id LEFT JOIN stores s ON s.id=o.store_id
+         WHERE o.status IN ('CONFIRMED','DISPATCHED') AND {$where}
+         GROUP BY c.name,s.name,oi.sku,oi.product_name,oi.size
+         ORDER BY c.name,s.name,oi.product_name,oi.size"
+    );
+    $statement->execute($params);
+    $products = $statement->fetchAll();
+
+    $params = [];
+    $where = [scopedWhere($pdo, $user, 'p', $params), 'p.deleted_at IS NULL'];
+    if ($cityId > 0) {
+        $where[] = 's.city_id = ?';
+        $params[] = $cityId;
+    }
+    if ($storeId > 0) {
+        $where[] = 'p.store_id = ?';
+        $params[] = $storeId;
+    }
+    $statement = $pdo->prepare(
+        'SELECT c.name AS city_name,s.name AS store_name,p.sku,p.name AS product_name,pv.size,
+                pv.stock,pv.reserved_stock,p.price,p.sale_price,p.active
+         FROM products p JOIN product_variants pv ON pv.product_id=p.id
+         JOIN stores s ON s.id=p.store_id JOIN cities c ON c.id=s.city_id
+         WHERE ' . implode(' AND ', $where) . ' ORDER BY c.name,s.name,p.name,pv.size'
+    );
+    $statement->execute($params);
+    $inventory = $statement->fetchAll();
+
+    $params = [];
+    $where = reportWhere($pdo, $user, 'im', 'im.created_at', $from, $to, $cityId, $storeId, $params);
+    $statement = $pdo->prepare(
+        "SELECT im.created_at,c.name AS city_name,s.name AS store_name,p.name AS product_name,pv.sku,pv.size,
+                im.movement_type,im.quantity_delta,im.balance_before,im.balance_after,im.actor_email,im.source,im.notes
+         FROM inventory_movements im
+         LEFT JOIN products p ON p.id=im.product_id LEFT JOIN product_variants pv ON pv.id=im.variant_id
+         LEFT JOIN stores s ON s.id=im.store_id LEFT JOIN cities c ON c.id=im.city_id
+         WHERE {$where} ORDER BY im.created_at,im.id"
+    );
+    $statement->execute($params);
+    $movements = $statement->fetchAll();
+
+    $salesTotal = array_sum(array_map(static fn (array $row): float => (float) $row['total'], $sales));
+    $units = array_sum(array_map(static fn (array $row): int => (int) $row['units'], $products));
+    $stock = array_sum(array_map(static fn (array $row): int => (int) $row['stock'], $inventory));
+    return [
+        'summary' => ['orders' => count($sales), 'sales_total' => $salesTotal, 'units' => $units, 'stock' => $stock, 'movements' => count($movements)],
+        'sales' => $sales,
+        'products' => $products,
+        'inventory' => $inventory,
+        'movements' => $movements,
+    ];
+}
+
+function reportWorkbook(array $report, string $from, string $to): array
+{
+    $summary = [['Métrica','Valor'],['Periodo',"{$from} a {$to}"],['Pedidos',$report['summary']['orders']],['Ventas',moneyExact($report['summary']['sales_total'])],['Unidades vendidas',$report['summary']['units']],['Stock actual',$report['summary']['stock']],['Movimientos',$report['summary']['movements']]];
+    $sales = [['Pedido','Fecha','Ciudad','Zona','Tienda','Cliente','Teléfono','Estado','Total','Revisado por']];
+    foreach ($report['sales'] as $row) $sales[] = [$row['id'],$row['payment_confirmed_at'],$row['city_name'],$row['zone_name'],$row['store_name'],$row['customer_name'],$row['phone'],$row['status'],moneyExact($row['total']),$row['reviewer_name']];
+    $products = [['Ciudad','Tienda','SKU','Producto','Variante','Unidades','Ventas']];
+    foreach ($report['products'] as $row) $products[] = [$row['city_name'],$row['store_name'],$row['sku'],$row['product_name'],$row['size'],$row['units'],moneyExact($row['revenue'])];
+    $inventory = [['Ciudad','Tienda','SKU','Producto','Variante','Stock','Reservado','Precio','Precio promo','Activo']];
+    foreach ($report['inventory'] as $row) $inventory[] = [$row['city_name'],$row['store_name'],$row['sku'],$row['product_name'],$row['size'],$row['stock'],$row['reserved_stock'],moneyExact($row['price']),$row['sale_price'] === null ? '' : moneyExact($row['sale_price']),(int)$row['active']===1?'Sí':'No'];
+    $movements = [['Fecha','Ciudad','Tienda','Producto','SKU','Variante','Movimiento','Cantidad','Saldo anterior','Saldo posterior','Usuario','Origen','Notas']];
+    foreach ($report['movements'] as $row) $movements[] = [$row['created_at'],$row['city_name'],$row['store_name'],$row['product_name'],$row['sku'],$row['size'],$row['movement_type'],$row['quantity_delta'],$row['balance_before'],$row['balance_after'],$row['actor_email'],$row['source'],$row['notes']];
+    return ['Resumen'=>$summary,'Ventas'=>$sales,'Productos vendidos'=>$products,'Inventario'=>$inventory,'Movimientos'=>$movements];
+}
+
 $pdo = null;
 $databaseError = null;
 try {
     $pdo = database();
+    setAuditContext($pdo, null, 'BOOTSTRAP');
     ensureBootstrapAdmin($pdo);
 } catch (Throwable $error) {
     $databaseError = $error->getMessage();
@@ -1052,22 +1278,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
     $statement->execute([$email]);
     $loginUser = $statement->fetch();
     if (is_array($loginUser) && password_verify($password, (string) $loginUser['password_hash'])) {
+        $loginUser = loadAuthorization($pdo, $loginUser);
+        recordAuthAudit($pdo, 'LOGIN_SUCCESS', $loginUser, $email);
         session_regenerate_id(true);
         $_SESSION['user_id'] = (int) $loginUser['id'];
         $_SESSION['csrf'] = bin2hex(random_bytes(32));
         $pdo->prepare('UPDATE users SET last_login_at = NOW() WHERE id = ?')->execute([(int) $loginUser['id']]);
         redirectWithFlash($basePath, 'Sesión iniciada.', 'success');
     }
+    recordAuthAudit($pdo, 'LOGIN_FAILED', null, $email);
     redirectWithFlash($basePath, 'Credenciales no válidas.', 'error', 'login');
 }
 
 if (($_GET['logout'] ?? '') === '1') {
+    if ($pdo instanceof PDO) {
+        recordAuthAudit($pdo, 'LOGOUT', currentUser($pdo));
+    }
     session_destroy();
     header('Location: ' . $basePath, true, 303);
     exit;
 }
 
 $user = $pdo instanceof PDO ? currentUser($pdo) : null;
+$requestAction = (string) ($_POST['action'] ?? 'REQUEST');
+$movementType = match ($requestAction) {
+    'restock_inventory' => 'RESTOCK',
+    'transfer_stock' => 'TRANSFER',
+    'approve' => 'SALE',
+    'cancel_order', 'delete_order' => 'RETURN',
+    'save_product' => 'CATALOG_STOCK',
+    default => null,
+};
+if ($pdo instanceof PDO) {
+    setAuditContext($pdo, $user, $requestAction, $movementType, isset($_POST['notes']) ? (string) $_POST['notes'] : null);
+}
 $allowedViews = $user === null ? ['login'] : [];
 if ($user !== null && can($user, 'orders.view')) {
     $allowedViews[] = 'orders';
@@ -1084,16 +1328,29 @@ if ($user !== null && can($user, 'inventory.view')) {
 if ($user !== null && can($user, 'stats.view')) {
     $allowedViews[] = 'stats';
 }
+if ($user !== null && can($user, 'reports.view')) {
+    $allowedViews[] = 'reports';
+}
 if ($user !== null && can($user, 'locations.manage')) {
     $allowedViews[] = 'locations';
 }
 if ($user !== null && can($user, 'users.manage')) {
     $allowedViews[] = 'users';
 }
+$isTraceabilityEntry = defined('TRACEABILITY_ENTRY') && TRACEABILITY_ENTRY === true;
 if ($user === null) {
     $view = 'login';
+} elseif ($isTraceabilityEntry) {
+    $view = can($user, 'audit.view') ? 'traceability' : 'no_access';
 } elseif (!in_array($view, $allowedViews, true)) {
     $view = $allowedViews[0] ?? 'no_access';
+}
+
+if ($isTraceabilityEntry && $user !== null && !can($user, 'audit.view')) {
+    http_response_code(403);
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acceso denegado</title></head><body><main><h1>Acceso denegado</h1><p>La trazabilidad global solo está disponible para administradores globales.</p><p><a href="' . escape($basePath) . '">Volver a Operator</a></p></main></body></html>';
+    exit;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof PDO) {
@@ -1224,6 +1481,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
 
 $counts = array_fill_keys(array_slice(ORDER_STATUSES, 1), 0);
 $orders = $products = $shipments = $cities = $zones = $stores = $users = $stats = $transferVariants = $restockVariants = $inventoryStore = $inventoryCity = [];
+$reportData = $auditRows = $auditActions = $auditEntities = $auditActors = [];
+$auditAction = $auditEntity = $auditOperation = '';
+$auditActorId = 0;
+$today = (new DateTimeImmutable('today'))->format('Y-m-d');
+$reportFrom = validReportDate((string) ($_GET['from'] ?? ''), (new DateTimeImmutable('first day of this month'))->format('Y-m-d'));
+$reportTo = validReportDate((string) ($_GET['to'] ?? ''), $today);
+if ($reportFrom > $reportTo) [$reportFrom, $reportTo] = [$reportTo, $reportFrom];
+$reportCityId = max(0, (int) ($_GET['city_id'] ?? 0));
+$reportStoreId = max(0, (int) ($_GET['store_id'] ?? 0));
 $visibleStores = [];
 $editProduct = null;
 $editVariants = [];
@@ -1246,6 +1512,40 @@ if ($pdo instanceof PDO && $user !== null) {
     if (!hasScope($user, 'GLOBAL')) {
         $storeIds = assignedStoreIds($pdo, $user);
         $visibleStores = array_values(array_filter($stores, fn ($store) => in_array((int) $store['id'], $storeIds, true)));
+    }
+    $visibleStoreIds = array_map(static fn (array $store): int => (int) $store['id'], $visibleStores);
+    $visibleCityIds = array_values(array_unique(array_map(static fn (array $store): int => (int) $store['city_id'], $visibleStores)));
+    if ($reportStoreId > 0 && !in_array($reportStoreId, $visibleStoreIds, true)) $reportStoreId = 0;
+    if ($reportCityId > 0 && !in_array($reportCityId, $visibleCityIds, true)) $reportCityId = 0;
+
+    if ($view === 'reports' && can($user, 'reports.view')) {
+        $reportData = loadReportData($pdo, $user, $reportFrom, $reportTo, $reportCityId, $reportStoreId);
+        if (($_GET['download'] ?? '') === 'xlsx') {
+            if (!can($user, 'reports.export')) throw new RuntimeException('No tienes permiso para exportar reportes.');
+            downloadXlsx(reportWorkbook($reportData, $reportFrom, $reportTo), "operator-report-{$reportFrom}-{$reportTo}.xlsx");
+        }
+    }
+
+    if ($view === 'traceability' && can($user, 'audit.view')) {
+        $auditAction = trim((string) ($_GET['action_name'] ?? ''));
+        $auditEntity = trim((string) ($_GET['entity_type'] ?? ''));
+        $auditActorId = max(0, (int) ($_GET['actor_user_id'] ?? 0));
+        $auditOperation = strtoupper(trim((string) ($_GET['operation'] ?? '')));
+        if (!in_array($auditOperation, ['INSERT','UPDATE','DELETE','AUTH'], true)) $auditOperation = '';
+        $params = [$reportFrom, $reportTo];
+        $where = ['a.created_at >= ?', 'a.created_at < DATE_ADD(?, INTERVAL 1 DAY)'];
+        if ($auditAction !== '') { $where[]='a.action_name=?'; $params[]=$auditAction; }
+        if ($auditEntity !== '') { $where[]='a.entity_type=?'; $params[]=$auditEntity; }
+        if ($auditActorId > 0) { $where[]='a.actor_user_id=?'; $params[]=$auditActorId; }
+        if ($auditOperation !== '') { $where[]='a.operation=?'; $params[]=$auditOperation; }
+        if ($reportCityId > 0) { $where[]='a.city_id=?'; $params[]=$reportCityId; }
+        if ($reportStoreId > 0) { $where[]='a.store_id=?'; $params[]=$reportStoreId; }
+        $statement = $pdo->prepare('SELECT a.*,c.name AS city_name,s.name AS store_name FROM audit_log a LEFT JOIN cities c ON c.id=a.city_id LEFT JOIN stores s ON s.id=a.store_id WHERE '.implode(' AND ',$where).' ORDER BY a.created_at DESC,a.id DESC LIMIT 500');
+        $statement->execute($params);
+        $auditRows = $statement->fetchAll();
+        $auditActions = $pdo->query('SELECT DISTINCT action_name FROM audit_log ORDER BY action_name')->fetchAll(PDO::FETCH_COLUMN);
+        $auditEntities = $pdo->query('SELECT DISTINCT entity_type FROM audit_log ORDER BY entity_type')->fetchAll(PDO::FETCH_COLUMN);
+        $auditActors = $pdo->query('SELECT actor_user_id,MAX(COALESCE(actor_name,actor_email)) AS actor_name FROM audit_log WHERE actor_user_id IS NOT NULL GROUP BY actor_user_id ORDER BY actor_name')->fetchAll();
     }
 
     if (can($user, 'orders.view')) {
@@ -1543,6 +1843,11 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     .role-option strong,.role-option small { display:block; }
     .role-option small { color:var(--muted); margin-top:2px; }
     .price-form { display:grid; grid-template-columns:1fr 1fr auto; align-items:end; gap:9px; }
+    .filter-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); align-items:end; gap:10px; margin-bottom:18px; }
+    .audit-list { display:grid; gap:10px; }
+    .audit-entry { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .audit-entry pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#f5f6f2; border-radius:8px; padding:10px; font-size:12px; }
+    .audit-meta { display:flex; flex-wrap:wrap; gap:8px 14px; color:var(--muted); font-size:13px; margin-top:6px; }
     [hidden] { display:none !important; }
     .variant-row { display:grid; grid-template-columns:1fr 1fr .8fr; gap:9px; margin-bottom:8px; }
     .empty { text-align:center; background:var(--panel); border:1px dashed #c5c8bf; border-radius:8px; padding:42px 20px; color:var(--muted); }
@@ -1557,11 +1862,11 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
 <header>
   <div class="wrap">
     <section>
-      <h1>Ventas WhatsApp</h1>
-      <p>Catálogo, pagos, usuarios y despacho</p>
+      <h1><?= $isTraceabilityEntry ? 'Trazabilidad del sistema' : 'Ventas WhatsApp' ?></h1>
+      <p><?= $isTraceabilityEntry ? 'Registro global e inmutable de cada cambio' : 'Catálogo, pagos, usuarios y despacho' ?></p>
     </section>
     <?php if ($user): ?>
-      <p><?= escape($user['name']) ?><br><strong><?= escape(roleSummary($user)) ?></strong> · <a href="<?= escape($basePath) ?>?logout=1" style="color:#fff">Salir</a></p>
+      <p><?= escape($user['name']) ?><br><strong><?= escape(roleSummary($user)) ?></strong><?php if (can($user, 'audit.view')): ?> · <a href="<?= escape($isTraceabilityEntry ? $basePath : $basePath . 'traceability.php') ?>" style="color:#fff"><?= $isTraceabilityEntry ? 'Volver a Operator' : 'Trazabilidad' ?></a><?php endif; ?> · <a href="<?= escape($basePath) ?>?logout=1" style="color:#fff">Salir</a></p>
     <?php endif; ?>
   </div>
 </header>
@@ -1580,13 +1885,34 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
       <p class="muted">Si es la primera instalación, se crea un admin inicial con `OPERATOR_ADMIN_EMAIL` y `OPERATOR_ADMIN_PASSWORD`.</p>
     </form>
   <?php elseif ($user): ?>
+    <?php if (!$isTraceabilityEntry): ?>
     <nav class="tabs">
       <?php foreach ($allowedViews as $allowedView): if ($allowedView === 'login') continue; ?>
-        <a class="tab <?= $view === $allowedView ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, $allowedView)) ?>"><?= escape(match ($allowedView) { 'orders' => 'Pedidos', 'catalog' => 'Catálogo', 'shipments' => 'Envíos', 'inventory' => 'Inventario', 'stats' => 'Estadísticas', 'locations' => 'Ubicaciones', 'users' => 'Usuarios', default => $allowedView }) ?></a>
+        <a class="tab <?= $view === $allowedView ? 'active' : '' ?>" href="<?= escape(viewUrl($basePath, $allowedView)) ?>"><?= escape(match ($allowedView) { 'orders' => 'Pedidos', 'catalog' => 'Catálogo', 'shipments' => 'Envíos', 'inventory' => 'Inventario', 'stats' => 'Estadísticas', 'reports' => 'Reportes', 'locations' => 'Ubicaciones', 'users' => 'Usuarios', default => $allowedView }) ?></a>
       <?php endforeach; ?>
     </nav>
+    <?php endif; ?>
 
-    <?php if ($view === 'catalog'): ?>
+    <?php if ($view === 'traceability' && can($user, 'audit.view')): ?>
+      <form class="panel filter-form" method="get" action="<?= escape($basePath . 'traceability.php') ?>">
+        <label><span>Desde</span><input type="date" name="from" value="<?= escape($reportFrom) ?>"></label>
+        <label><span>Hasta</span><input type="date" name="to" value="<?= escape($reportTo) ?>"></label>
+        <label><span>Operación</span><select name="operation"><option value="">Todas</option><?php foreach (['INSERT','UPDATE','DELETE','AUTH'] as $operation): ?><option value="<?= $operation ?>" <?= ($auditOperation ?? '')===$operation?'selected':'' ?>><?= $operation ?></option><?php endforeach; ?></select></label>
+        <label><span>Acción</span><select name="action_name"><option value="">Todas</option><?php foreach ($auditActions as $actionName): ?><option value="<?= escape($actionName) ?>" <?= ($auditAction ?? '')===$actionName?'selected':'' ?>><?= escape($actionName) ?></option><?php endforeach; ?></select></label>
+        <label><span>Entidad</span><select name="entity_type"><option value="">Todas</option><?php foreach ($auditEntities as $entityType): ?><option value="<?= escape($entityType) ?>" <?= ($auditEntity ?? '')===$entityType?'selected':'' ?>><?= escape($entityType) ?></option><?php endforeach; ?></select></label>
+        <label><span>Usuario</span><select name="actor_user_id"><option value="">Todos</option><?php foreach ($auditActors as $actor): ?><option value="<?= (int)$actor['actor_user_id'] ?>" <?= ($auditActorId ?? 0)===(int)$actor['actor_user_id']?'selected':'' ?>><?= escape($actor['actor_name']) ?></option><?php endforeach; ?></select></label>
+        <label><span>Ciudad</span><select name="city_id"><option value="">Todas</option><?php foreach ($cities as $city): ?><option value="<?= (int)$city['id'] ?>" <?= $reportCityId===(int)$city['id']?'selected':'' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select></label>
+        <label><span>Tienda</span><select name="store_id"><option value="">Todas</option><?php foreach ($stores as $store): ?><option value="<?= (int)$store['id'] ?>" <?= $reportStoreId===(int)$store['id']?'selected':'' ?>><?= escape($store['city_name'].' · '.$store['name']) ?></option><?php endforeach; ?></select></label>
+        <button class="primary" type="submit">Filtrar trazabilidad</button>
+      </form>
+      <p class="muted" style="margin-bottom:12px">Mostrando hasta 500 cambios. Los registros no pueden modificarse ni eliminarse.</p>
+      <section class="audit-list">
+        <?php foreach ($auditRows as $audit): ?>
+          <article class="audit-entry"><strong><?= escape($audit['action_name'].' · '.$audit['operation'].' · '.$audit['entity_type'].' #'.($audit['entity_id']??'')) ?></strong><div class="audit-meta"><span><?= escape($audit['created_at']) ?></span><span><?= escape($audit['actor_name'] ?: $audit['actor_email'] ?: 'Sistema') ?></span><span><?= escape(trim(($audit['city_name']??'').' · '.($audit['store_name']??''),' ·')) ?></span><span><?= escape($audit['source']) ?></span><span>IP <?= escape($audit['ip_address']) ?></span></div><?php if ($audit['before_data']): ?><details><summary>Valores anteriores</summary><pre><?= escape((string)json_encode(json_decode($audit['before_data'],true),JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?></pre></details><?php endif; ?><?php if ($audit['after_data']): ?><details><summary>Valores posteriores</summary><pre><?= escape((string)json_encode(json_decode($audit['after_data'],true),JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?></pre></details><?php endif; ?></article>
+        <?php endforeach; ?>
+        <?php if ($auditRows===[]): ?><div class="empty">No hay cambios para los filtros seleccionados.</div><?php endif; ?>
+      </section>
+    <?php elseif ($view === 'catalog'): ?>
       <section class="<?= can($user, 'catalog.write') ? 'split' : 'grid' ?>">
         <?php if (can($user, 'catalog.write')): ?>
         <form class="panel catalog" method="post" enctype="multipart/form-data" action="<?= escape($basePath) ?>">
@@ -1716,6 +2042,22 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
           <table><thead><tr><th>Ciudad</th><th>Producto</th><th>Talla</th><th>Stock ciudad</th><th>Tiendas</th></tr></thead><tbody><?php foreach ($inventoryCity as $row): ?><tr><td><?= escape($row['city_name']) ?></td><td><?= escape($row['product_name']) ?><br><span class="muted"><?= escape(trim(($row['category'] ?? '') . ' · ' . ($row['type'] ?? ''), ' ·')) ?></span></td><td><?= escape($row['size']) ?></td><td><strong><?= (int) $row['city_stock'] ?></strong></td><td><?= (int) $row['stores_with_product'] ?></td></tr><?php endforeach; ?></tbody></table>
         </div>
       </section>
+    <?php elseif ($view === 'reports' && can($user, 'reports.view')): ?>
+      <form class="panel filter-form" method="get" action="<?= escape($basePath) ?>">
+        <input type="hidden" name="view" value="reports">
+        <label><span>Desde</span><input type="date" name="from" value="<?= escape($reportFrom) ?>"></label>
+        <label><span>Hasta</span><input type="date" name="to" value="<?= escape($reportTo) ?>"></label>
+        <label><span>Ciudad</span><select name="city_id"><option value="">Todas las permitidas</option><?php foreach ($cities as $city): if (!in_array((int)$city['id'],$visibleCityIds,true)) continue; ?><option value="<?= (int)$city['id'] ?>" <?= $reportCityId===(int)$city['id']?'selected':'' ?>><?= escape($city['name']) ?></option><?php endforeach; ?></select></label>
+        <label><span>Tienda</span><select name="store_id"><option value="">Todas las permitidas</option><?php foreach ($visibleStores as $store): ?><option value="<?= (int)$store['id'] ?>" <?= $reportStoreId===(int)$store['id']?'selected':'' ?>><?= escape($store['city_name'].' · '.$store['name']) ?></option><?php endforeach; ?></select></label>
+        <button class="primary" type="submit">Generar reporte</button>
+        <?php if (can($user,'reports.export')): ?><a class="button secondary" href="<?= escape(viewUrl($basePath,'reports',['from'=>$reportFrom,'to'=>$reportTo,'city_id'=>$reportCityId ?: null,'store_id'=>$reportStoreId ?: null,'download'=>'xlsx'])) ?>">Descargar Excel</a><?php endif; ?>
+      </form>
+      <section class="summary"><div class="metric"><span>Ventas</span><strong><?= moneyExact($reportData['summary']['sales_total']??0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int)($reportData['summary']['orders']??0) ?></strong></div><div class="metric"><span>Unidades vendidas</span><strong><?= (int)($reportData['summary']['units']??0) ?></strong></div><div class="metric"><span>Stock actual</span><strong><?= (int)($reportData['summary']['stock']??0) ?></strong></div><div class="metric"><span>Movimientos</span><strong><?= (int)($reportData['summary']['movements']??0) ?></strong></div></section>
+      <section class="grid">
+        <div class="panel"><h2>Ventas del periodo</h2><table><thead><tr><th>Fecha</th><th>Pedido</th><th>Ciudad</th><th>Tienda</th><th>Cliente</th><th>Total</th></tr></thead><tbody><?php foreach (($reportData['sales']??[]) as $row): ?><tr><td><?= escape($row['payment_confirmed_at']) ?></td><td>#<?= (int)$row['id'] ?></td><td><?= escape($row['city_name']) ?></td><td><?= escape($row['store_name']) ?></td><td><?= escape($row['customer_name']) ?></td><td><?= moneyExact($row['total']) ?></td></tr><?php endforeach; ?></tbody></table></div>
+        <div class="panel"><h2>Inventario actual</h2><table><thead><tr><th>Ciudad</th><th>Tienda</th><th>Producto</th><th>Variante</th><th>Stock</th><th>Reservado</th></tr></thead><tbody><?php foreach (($reportData['inventory']??[]) as $row): ?><tr><td><?= escape($row['city_name']) ?></td><td><?= escape($row['store_name']) ?></td><td><?= escape($row['product_name']) ?></td><td><?= escape($row['size']) ?></td><td><?= (int)$row['stock'] ?></td><td><?= (int)$row['reserved_stock'] ?></td></tr><?php endforeach; ?></tbody></table></div>
+        <div class="panel"><h2>Movimientos del periodo</h2><table><thead><tr><th>Fecha</th><th>Tienda</th><th>Producto</th><th>Tipo</th><th>Cantidad</th><th>Saldo</th><th>Usuario</th></tr></thead><tbody><?php foreach (($reportData['movements']??[]) as $row): ?><tr><td><?= escape($row['created_at']) ?></td><td><?= escape($row['store_name']) ?></td><td><?= escape($row['product_name'].' · '.$row['size']) ?></td><td><?= escape($row['movement_type']) ?></td><td><?= (int)$row['quantity_delta'] ?></td><td><?= (int)$row['balance_before'] ?> → <?= (int)$row['balance_after'] ?></td><td><?= escape($row['actor_email'] ?: $row['source']) ?></td></tr><?php endforeach; ?></tbody></table></div>
+      </section>
     <?php elseif ($view === 'stats' && can($user, 'stats.view')): ?>
       <section class="grid">
         <div class="summary"><div class="metric"><span>Ventas</span><strong>$<?= money($stats['summary']['sales_total'] ?? 0) ?></strong></div><div class="metric"><span>Pedidos</span><strong><?= (int) ($stats['summary']['orders_count'] ?? 0) ?></strong></div><div class="metric"><span>Ticket promedio</span><strong>$<?= money($stats['summary']['average_ticket'] ?? 0) ?></strong></div><div class="metric"><span>Unidades en inventario</span><strong><?= (int) ($stats['inventory']['stock_units'] ?? 0) ?></strong></div><div class="metric"><span>Productos activos</span><strong><?= (int) ($stats['inventory']['products_count'] ?? 0) ?></strong></div><div class="metric"><span>Tiendas visibles</span><strong><?= (int) ($stats['inventory']['stores_count'] ?? 0) ?></strong></div></div>
@@ -1753,47 +2095,6 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     <?php endif; ?>
   <?php endif; ?>
 </main>
-<script>
-  (() => {
-    const supplierNet = document.getElementById('supplier-net-price');
-    const supplierVatRate = document.getElementById('supplier-vat-rate');
-    const supplierVatAmount = document.getElementById('supplier-vat-amount');
-    const supplierTotalPrice = document.getElementById('supplier-total-price');
-    const suggestedCatalogPrice = document.getElementById('suggested-catalog-price');
-    if (supplierNet && supplierVatRate && supplierVatAmount && supplierTotalPrice && suggestedCatalogPrice) {
-      const updateSupplierPrices = () => {
-        const net = Number.parseFloat(supplierNet.value) || 0;
-        const vatRate = Number.parseFloat(supplierVatRate.value) || 0;
-        const vat = Math.round(net * vatRate) / 100;
-        const total = Math.round((net + vat) * 100) / 100;
-        supplierVatAmount.textContent = vat.toFixed(2).replace('.', ',');
-        supplierTotalPrice.textContent = total.toFixed(2).replace('.', ',');
-        suggestedCatalogPrice.textContent = (Math.round(total * 130) / 100).toFixed(2).replace('.', ',');
-      };
-      supplierNet.addEventListener('input', updateSupplierPrices);
-      supplierVatRate.addEventListener('input', updateSupplierPrices);
-      updateSupplierPrices();
-    }
-
-    const roles = Array.from(document.querySelectorAll('#user-role-list input[name="role_codes[]"]'));
-    const cityGroup = document.getElementById('user-city-assignments');
-    const storeGroup = document.getElementById('user-store-assignments');
-    if (roles.length === 0 || !cityGroup || !storeGroup) return;
-
-    const updateAssignments = () => {
-      const scopes = roles.filter((role) => role.checked).map((role) => role.dataset.scope);
-      const globalScope = scopes.includes('GLOBAL');
-      const needsCity = !globalScope && scopes.includes('CITY');
-      const needsStore = !globalScope && scopes.includes('STORE');
-      cityGroup.hidden = !needsCity;
-      storeGroup.hidden = !needsStore;
-      cityGroup.querySelector('select').disabled = !needsCity;
-      storeGroup.querySelector('select').disabled = !needsStore;
-    };
-
-    roles.forEach((role) => role.addEventListener('change', updateAssignments));
-    updateAssignments();
-  })();
-</script>
+<script src="<?= escape($basePath . 'app.js') ?>" defer></script>
 </body>
 </html>
