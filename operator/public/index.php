@@ -69,6 +69,11 @@ function money(float|string|null $value): string
     return number_format((float) $value, 0, ',', '.');
 }
 
+function moneyExact(float|string|null $value): string
+{
+    return number_format((float) $value, 2, ',', '.');
+}
+
 function statusLabel(string $status): string
 {
     return match ($status) {
@@ -358,9 +363,13 @@ function saveProduct(PDO $pdo, array $user): int
     $color = trim((string) ($_POST['color'] ?? ''));
     $gender = trim((string) ($_POST['gender'] ?? ''));
     $description = trim((string) ($_POST['description'] ?? ''));
-    $price = filter_var($_POST['price'] ?? null, FILTER_VALIDATE_FLOAT);
+    $canManageCost = can($user, 'catalog.cost');
+    $canManagePrice = can($user, 'catalog.price');
+    $supplierNetPrice = $canManageCost ? filter_var($_POST['supplier_net_price'] ?? null, FILTER_VALIDATE_FLOAT) : null;
+    $supplierVatRate = $canManageCost ? filter_var($_POST['supplier_vat_rate'] ?? null, FILTER_VALIDATE_FLOAT) : null;
+    $price = $canManagePrice ? filter_var($_POST['price'] ?? null, FILTER_VALIDATE_FLOAT) : null;
     $salePriceRaw = trim((string) ($_POST['sale_price'] ?? ''));
-    $salePrice = $salePriceRaw === '' ? null : filter_var($salePriceRaw, FILTER_VALIDATE_FLOAT);
+    $salePrice = $canManagePrice && $salePriceRaw !== '' ? filter_var($salePriceRaw, FILTER_VALIDATE_FLOAT) : null;
     $active = isset($_POST['active']) ? 1 : 0;
     $imageUrl = trim((string) ($_POST['image_url'] ?? ''));
     $uploadedImage = uploadImage();
@@ -370,10 +379,16 @@ function saveProduct(PDO $pdo, array $user): int
     if ($name === '' || $category === '' || $type === '') {
         throw new RuntimeException('Nombre, categoría y tipo son obligatorios.');
     }
-    if ($price === false || $price < 0) {
+    if ($canManageCost && ($supplierNetPrice === false || $supplierNetPrice < 0)) {
+        throw new RuntimeException('El importe neto del proveedor debe ser válido.');
+    }
+    if ($canManageCost && ($supplierVatRate === false || $supplierVatRate < 0 || $supplierVatRate > 100)) {
+        throw new RuntimeException('El porcentaje de IVA debe estar entre 0 y 100.');
+    }
+    if ($canManagePrice && $productId !== false && ($price === false || $price < 0)) {
         throw new RuntimeException('El precio debe ser válido.');
     }
-    if ($salePriceRaw !== '' && ($salePrice === false || $salePrice < 0)) {
+    if ($canManagePrice && $salePriceRaw !== '' && ($salePrice === false || $salePrice < 0)) {
         throw new RuntimeException('El precio promocional debe ser válido.');
     }
 
@@ -418,22 +433,40 @@ function saveProduct(PDO $pdo, array $user): int
     try {
         $existingVariantIds = [];
         if ($productId !== false) {
-            $statement = $pdo->prepare('SELECT store_id FROM products WHERE id = ? FOR UPDATE');
+            $statement = $pdo->prepare('SELECT * FROM products WHERE id = ? FOR UPDATE');
             $statement->execute([(int) $productId]);
-            $existingStore = $statement->fetchColumn();
-            if ($existingStore === false) {
+            $existingProduct = $statement->fetch();
+            if (!is_array($existingProduct)) {
                 throw new RuntimeException('Producto no encontrado.');
             }
-            assertStoreAccess($pdo, $user, (int) $existingStore);
-            $statement = $pdo->prepare('UPDATE products SET store_id = ?, sku = ?, name = ?, description = ?, category = ?, type = ?, brand = ?, color = ?, gender = ?, aliases = ?, unit = ?, price = ?, sale_price = ?, stock = ?, image_url = ?, active = ? WHERE id = ?');
-            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active, (int) $productId]);
+            assertStoreAccess($pdo, $user, (int) $existingProduct['store_id']);
+            if ($canManageCost) {
+                $supplierVatAmount = round((float) $supplierNetPrice * (float) $supplierVatRate / 100, 2);
+                $supplierTotalPrice = round((float) $supplierNetPrice + $supplierVatAmount, 2);
+            } else {
+                $supplierNetPrice = (float) $existingProduct['supplier_net_price'];
+                $supplierVatRate = (float) $existingProduct['supplier_vat_rate'];
+                $supplierVatAmount = (float) $existingProduct['supplier_vat_amount'];
+                $supplierTotalPrice = (float) $existingProduct['supplier_total_price'];
+            }
+            if (!$canManagePrice) {
+                $price = (float) $existingProduct['price'];
+                $salePrice = $existingProduct['sale_price'] === null ? null : (float) $existingProduct['sale_price'];
+            }
+            $statement = $pdo->prepare('UPDATE products SET store_id = ?, sku = ?, name = ?, description = ?, category = ?, type = ?, brand = ?, color = ?, gender = ?, aliases = ?, unit = ?, supplier_net_price = ?, supplier_vat_rate = ?, supplier_vat_amount = ?, supplier_total_price = ?, price = ?, sale_price = ?, stock = ?, image_url = ?, active = ? WHERE id = ?');
+            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $supplierNetPrice, $supplierVatRate, $supplierVatAmount, $supplierTotalPrice, $price, $salePrice, $totalStock, $imageUrl ?: null, $active, (int) $productId]);
             $savedId = (int) $productId;
             $statement = $pdo->prepare('SELECT id FROM product_variants WHERE product_id = ? FOR UPDATE');
             $statement->execute([$savedId]);
             $existingVariantIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
         } else {
-            $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active]);
+            $supplierNetPrice = $canManageCost ? (float) $supplierNetPrice : 0.0;
+            $supplierVatRate = $canManageCost ? (float) $supplierVatRate : 0.0;
+            $supplierVatAmount = round($supplierNetPrice * $supplierVatRate / 100, 2);
+            $supplierTotalPrice = round($supplierNetPrice + $supplierVatAmount, 2);
+            $price = round($supplierTotalPrice * 1.30, 2);
+            $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, supplier_net_price, supplier_vat_rate, supplier_vat_amount, supplier_total_price, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)');
+            $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $supplierNetPrice, $supplierVatRate, $supplierVatAmount, $supplierTotalPrice, $price, $totalStock, $imageUrl ?: null, $active]);
             $savedId = (int) $pdo->lastInsertId();
         }
         $variantInsert = $pdo->prepare('INSERT INTO product_variants (product_id, sku, size, stock, active) VALUES (?, ?, ?, ?, ?)');
@@ -469,6 +502,33 @@ function saveProduct(PDO $pdo, array $user): int
         }
         throw $error;
     }
+}
+
+function saveProductPrice(PDO $pdo, array $user): int
+{
+    if (!can($user, 'catalog.price')) {
+        throw new RuntimeException('No tienes permiso para modificar el precio de venta.');
+    }
+    $productId = filter_var($_POST['product_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $price = filter_var($_POST['price'] ?? null, FILTER_VALIDATE_FLOAT);
+    $salePriceRaw = trim((string) ($_POST['sale_price'] ?? ''));
+    $salePrice = $salePriceRaw === '' ? null : filter_var($salePriceRaw, FILTER_VALIDATE_FLOAT);
+    if ($productId === false || $price === false || $price < 0) {
+        throw new RuntimeException('Producto y precio normal deben ser válidos.');
+    }
+    if ($salePriceRaw !== '' && ($salePrice === false || $salePrice < 0)) {
+        throw new RuntimeException('El precio promocional debe ser válido.');
+    }
+    $statement = $pdo->prepare('SELECT store_id FROM products WHERE id = ? AND deleted_at IS NULL');
+    $statement->execute([(int) $productId]);
+    $storeId = $statement->fetchColumn();
+    if ($storeId === false) {
+        throw new RuntimeException('Producto no encontrado.');
+    }
+    assertStoreAccess($pdo, $user, (int) $storeId);
+    $pdo->prepare('UPDATE products SET price = ?, sale_price = ? WHERE id = ?')
+        ->execute([(float) $price, $salePrice, (int) $productId]);
+    return (int) $productId;
 }
 
 function deleteProduct(PDO $pdo, array $user): void
@@ -563,7 +623,7 @@ function transferStock(PDO $pdo, array $user): void
     $pdo->beginTransaction();
     try {
         $statement = $pdo->prepare(
-            'SELECT pv.*, p.store_id, p.name, p.description, p.category, p.type, p.brand, p.color, p.gender, p.aliases, p.unit, p.price, p.sale_price, p.image_url, s.city_id
+            'SELECT pv.*, p.store_id, p.name, p.description, p.category, p.type, p.brand, p.color, p.gender, p.aliases, p.unit, p.supplier_net_price, p.supplier_vat_rate, p.supplier_vat_amount, p.supplier_total_price, p.price, p.sale_price, p.image_url, s.city_id
              FROM product_variants pv
              JOIN products p ON p.id = pv.product_id
              JOIN stores s ON s.id = p.store_id
@@ -617,8 +677,8 @@ function transferStock(PDO $pdo, array $user): void
                 $targetSku = substr((string) $source['sku'] . '-S' . (int) $toStoreId . '-' . $suffix, 0, 64);
                 $suffix++;
             }
-            $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, TRUE)');
-            $statement->execute([(int) $toStoreId, $targetSku, $source['name'], $source['description'], $source['category'], $source['type'], $source['brand'], $source['color'], $source['gender'], $source['aliases'], $source['unit'], $source['price'], $source['sale_price'], $source['image_url']]);
+            $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, supplier_net_price, supplier_vat_rate, supplier_vat_amount, supplier_total_price, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, TRUE)');
+            $statement->execute([(int) $toStoreId, $targetSku, $source['name'], $source['description'], $source['category'], $source['type'], $source['brand'], $source['color'], $source['gender'], $source['aliases'], $source['unit'], $source['supplier_net_price'], $source['supplier_vat_rate'], $source['supplier_vat_amount'], $source['supplier_total_price'], $source['price'], $source['sale_price'], $source['image_url']]);
             $targetProductId = (int) $pdo->lastInsertId();
             if ($source['image_url']) {
                 $pdo->prepare('INSERT INTO product_images (product_id, image_url, is_primary) VALUES (?, ?, TRUE)')
@@ -1012,7 +1072,7 @@ $allowedViews = $user === null ? ['login'] : [];
 if ($user !== null && can($user, 'orders.view')) {
     $allowedViews[] = 'orders';
 }
-if ($user !== null && can($user, 'catalog.write')) {
+if ($user !== null && (can($user, 'catalog.write') || can($user, 'catalog.price') || can($user, 'catalog.cost'))) {
     $allowedViews[] = 'catalog';
 }
 if ($user !== null && can($user, 'shipments.view')) {
@@ -1046,6 +1106,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
         if ($action === 'save_product') {
             $savedId = saveProduct($pdo, $user);
             redirectWithFlash($basePath, "Producto #{$savedId} guardado.", 'success', 'catalog', ['edit' => $savedId]);
+        }
+        if ($action === 'save_product_price') {
+            $savedId = saveProductPrice($pdo, $user);
+            redirectWithFlash($basePath, "Precio del producto #{$savedId} actualizado.", 'success', 'catalog');
         }
         if ($action === 'toggle_product') {
             if (!can($user, 'catalog.write')) {
@@ -1218,7 +1282,7 @@ if ($pdo instanceof PDO && $user !== null) {
         unset($order);
     }
 
-    if (can($user, 'catalog.write')) {
+    if (can($user, 'catalog.write') || can($user, 'catalog.price') || can($user, 'catalog.cost')) {
         $params = [];
         $where = scopedWhere($pdo, $user, 'p', $params);
         $statement = $pdo->prepare(
@@ -1236,7 +1300,7 @@ if ($pdo instanceof PDO && $user !== null) {
         $statement->execute($params);
         $products = $statement->fetchAll();
         $editId = filter_var($_GET['edit'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-        if ($editId !== false && $editId !== null) {
+        if (can($user, 'catalog.write') && $editId !== false && $editId !== null) {
             $params = [(int) $editId];
             $scope = scopedWhere($pdo, $user, 'p', $params);
             $statement = $pdo->prepare("SELECT * FROM products p WHERE p.id = ? AND p.deleted_at IS NULL AND {$scope}");
@@ -1397,7 +1461,7 @@ if ($pdo instanceof PDO && $user !== null) {
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
 $totalOrders = array_sum($counts);
-$formProduct = $editProduct ?? ['id' => '', 'store_id' => $visibleStores[0]['id'] ?? '', 'name' => '', 'description' => '', 'category' => '', 'type' => '', 'brand' => '', 'color' => '', 'gender' => '', 'price' => '', 'sale_price' => '', 'image_url' => '', 'aliases' => '[]', 'active' => 1];
+$formProduct = $editProduct ?? ['id' => '', 'store_id' => $visibleStores[0]['id'] ?? '', 'name' => '', 'description' => '', 'category' => '', 'type' => '', 'brand' => '', 'color' => '', 'gender' => '', 'supplier_net_price' => '', 'supplier_vat_rate' => '', 'supplier_vat_amount' => '', 'supplier_total_price' => '', 'price' => '', 'sale_price' => '', 'image_url' => '', 'aliases' => '[]', 'active' => 1];
 if ($editVariants === []) {
     $editVariants = [['id' => '', 'sku' => '', 'size' => '', 'stock' => 0]];
 }
@@ -1478,6 +1542,7 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     .role-option input { margin:3px 0 0; flex:0 0 auto; }
     .role-option strong,.role-option small { display:block; }
     .role-option small { color:var(--muted); margin-top:2px; }
+    .price-form { display:grid; grid-template-columns:1fr 1fr auto; align-items:end; gap:9px; }
     [hidden] { display:none !important; }
     .variant-row { display:grid; grid-template-columns:1fr 1fr .8fr; gap:9px; margin-bottom:8px; }
     .empty { text-align:center; background:var(--panel); border:1px dashed #c5c8bf; border-radius:8px; padding:42px 20px; color:var(--muted); }
@@ -1485,7 +1550,7 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     th,td { text-align:left; padding:12px; border-bottom:1px solid var(--line); vertical-align:top; }
     th { background:#eef0ea; font-size:12px; text-transform:uppercase; color:var(--muted); }
     .login { max-width:420px; margin:40px auto; }
-    @media (max-width:860px) { header .wrap{align-items:start;flex-direction:column}.split,.body,.fields{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.variant-row{grid-template-columns:1fr} }
+    @media (max-width:860px) { header .wrap{align-items:start;flex-direction:column}.split,.body,.fields,.price-form{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.variant-row{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -1522,7 +1587,8 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
     </nav>
 
     <?php if ($view === 'catalog'): ?>
-      <section class="split">
+      <section class="<?= can($user, 'catalog.write') ? 'split' : 'grid' ?>">
+        <?php if (can($user, 'catalog.write')): ?>
         <form class="panel catalog" method="post" enctype="multipart/form-data" action="<?= escape($basePath) ?>">
           <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
           <input type="hidden" name="action" value="save_product">
@@ -1538,8 +1604,21 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
             <label><span>Marca</span><input name="brand" value="<?= escape((string) $formProduct['brand']) ?>"></label>
             <label><span>Color</span><input name="color" value="<?= escape((string) $formProduct['color']) ?>"></label>
             <label><span>Género</span><input name="gender" value="<?= escape((string) $formProduct['gender']) ?>"></label>
-            <label><span>Precio</span><input name="price" required inputmode="decimal" value="<?= escape((string) $formProduct['price']) ?>"></label>
-            <label><span>Precio promo</span><input name="sale_price" inputmode="decimal" value="<?= escape((string) $formProduct['sale_price']) ?>"></label>
+            <?php if (can($user, 'catalog.cost')): ?>
+              <label><span>Importe neto proveedor</span><input id="supplier-net-price" name="supplier_net_price" required inputmode="decimal" value="<?= escape((string) $formProduct['supplier_net_price']) ?>"></label>
+              <label><span>IVA (%)</span><input id="supplier-vat-rate" name="supplier_vat_rate" required inputmode="decimal" value="<?= escape((string) $formProduct['supplier_vat_rate']) ?>"></label>
+              <div class="fact"><span>Importe IVA</span><strong id="supplier-vat-amount"><?= moneyExact($formProduct['supplier_vat_amount']) ?></strong></div>
+              <div class="fact"><span>Total proveedor con IVA</span><strong id="supplier-total-price"><?= moneyExact($formProduct['supplier_total_price']) ?></strong></div>
+              <div class="fact wide"><span>Precio inicial sugerido (+30 %)</span><strong id="suggested-catalog-price"><?= moneyExact($formProduct['id'] ? $formProduct['supplier_total_price'] * 1.30 : 0) ?></strong><small class="muted">Se aplica automáticamente al crear el producto.</small></div>
+            <?php else: ?>
+              <div class="fact wide"><span>Valores del proveedor</span>Solo el proveedor y el admin global pueden modificarlos.</div>
+            <?php endif; ?>
+            <?php if (can($user, 'catalog.price') && $editProduct): ?>
+              <label><span>Precio normal de venta</span><input name="price" required inputmode="decimal" value="<?= escape((string) $formProduct['price']) ?>"></label>
+              <label><span>Precio promocional</span><input name="sale_price" inputmode="decimal" value="<?= escape((string) $formProduct['sale_price']) ?>"></label>
+            <?php else: ?>
+              <div class="fact wide"><span>Precio de catálogo</span><?= $editProduct ? money($formProduct['sale_price'] ?: $formProduct['price']) : 'Se calculará al guardar' ?><small class="muted">Solo vendedor, gerente de tienda y admin global pueden modificar el precio final.</small></div>
+            <?php endif; ?>
             <label class="wide"><span>Descripción</span><textarea name="description"><?= escape((string) $formProduct['description']) ?></textarea></label>
             <label class="wide"><span>Aliases, uno por línea</span><textarea name="aliases"><?= escape($aliasesText) ?></textarea></label>
             <label class="wide"><span>Subir foto</span><input type="file" name="image" accept="image/jpeg,image/png,image/webp"></label>
@@ -1552,6 +1631,7 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
           <?php endfor; ?>
           <div class="actions"><button class="approve" type="submit">Guardar producto</button><?php if ($editProduct): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
+        <?php endif; ?>
         <section class="grid">
           <?php if (can($user, 'inventory.transfer')): ?>
             <form class="panel stacked" method="post" action="<?= escape($basePath) ?>">
@@ -1570,8 +1650,9 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
           <?php foreach ($products as $product): ?>
             <article class="product">
               <div class="head"><div class="title"><h2><?= escape($product['name']) ?></h2><span class="badge <?= (int) $product['active'] === 1 ? 'active-badge' : 'inactive-badge' ?>"><?= (int) $product['active'] === 1 ? 'Activo' : 'Inactivo' ?></span></div><strong>$<?= money($product['sale_price'] ?: $product['price']) ?></strong></div>
-              <div class="body"><div><?php if ($product['image_url']): ?><img class="hero-img" src="<?= escape(imageSrc($basePath, $product['image_url'])) ?>" alt="" loading="lazy"><?php endif; ?></div><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($product['city_name'] ?? '') . ' · ' . ($product['store_name'] ?? '')) ?></div><div class="fact"><span>Categoría</span><?= escape($product['category']) ?> · <?= escape($product['type']) ?></div><div class="fact"><span>Stock</span><?= (int) $product['total_variant_stock'] ?> · <?= escape($product['variant_summary'] ?? '') ?></div><div class="fact"><span>Descripción</span><?= nl2br(escape($product['description'])) ?></div></div></div>
-              <div class="actions"><a class="button secondary" href="<?= escape(viewUrl($basePath, 'catalog', ['edit' => (int) $product['id']])) ?>">Editar</a><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="toggle_product"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><button class="<?= (int) $product['active'] === 1 ? 'reject' : 'approve' ?>" type="submit"><?= (int) $product['active'] === 1 ? 'Desactivar' : 'Activar' ?></button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="delete_product"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><button class="danger" type="submit">Eliminar</button></form></div>
+              <div class="body"><div><?php if ($product['image_url']): ?><img class="hero-img" src="<?= escape(imageSrc($basePath, $product['image_url'])) ?>" alt="" loading="lazy"><?php endif; ?></div><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($product['city_name'] ?? '') . ' · ' . ($product['store_name'] ?? '')) ?></div><div class="fact"><span>Categoría</span><?= escape($product['category']) ?> · <?= escape($product['type']) ?></div><div class="fact"><span>Stock</span><?= (int) $product['total_variant_stock'] ?> · <?= escape($product['variant_summary'] ?? '') ?></div><?php if (can($user, 'catalog.cost')): ?><div class="fact"><span>Proveedor</span>Neto <?= moneyExact($product['supplier_net_price']) ?> · IVA <?= escape((string) $product['supplier_vat_rate']) ?> % (<?= moneyExact($product['supplier_vat_amount']) ?>) · total <?= moneyExact($product['supplier_total_price']) ?></div><?php endif; ?><div class="fact"><span>Descripción</span><?= nl2br(escape($product['description'])) ?></div></div></div>
+              <?php if (can($user, 'catalog.price')): ?><form class="actions price-form" method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="save_product_price"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><label><span>Precio normal</span><input name="price" required inputmode="decimal" value="<?= escape((string) $product['price']) ?>"></label><label><span>Precio promo</span><input name="sale_price" inputmode="decimal" value="<?= escape((string) $product['sale_price']) ?>"></label><button class="primary" type="submit">Guardar precio</button></form><?php endif; ?>
+              <?php if (can($user, 'catalog.write')): ?><div class="actions"><a class="button secondary" href="<?= escape(viewUrl($basePath, 'catalog', ['edit' => (int) $product['id']])) ?>">Editar ficha</a><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="toggle_product"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><button class="<?= (int) $product['active'] === 1 ? 'reject' : 'approve' ?>" type="submit"><?= (int) $product['active'] === 1 ? 'Desactivar' : 'Activar' ?></button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="action" value="delete_product"><input type="hidden" name="view" value="catalog"><input type="hidden" name="product_id" value="<?= (int) $product['id'] ?>"><button class="danger" type="submit">Eliminar</button></form></div><?php endif; ?>
             </article>
           <?php endforeach; ?>
           <?php if ($products === []): ?><div class="empty">No hay productos visibles para tu rol.</div><?php endif; ?>
@@ -1674,6 +1755,26 @@ $formRoleCodes = $editUser === null ? ['SELLER'] : $editUserRoleCodes;
 </main>
 <script>
   (() => {
+    const supplierNet = document.getElementById('supplier-net-price');
+    const supplierVatRate = document.getElementById('supplier-vat-rate');
+    const supplierVatAmount = document.getElementById('supplier-vat-amount');
+    const supplierTotalPrice = document.getElementById('supplier-total-price');
+    const suggestedCatalogPrice = document.getElementById('suggested-catalog-price');
+    if (supplierNet && supplierVatRate && supplierVatAmount && supplierTotalPrice && suggestedCatalogPrice) {
+      const updateSupplierPrices = () => {
+        const net = Number.parseFloat(supplierNet.value) || 0;
+        const vatRate = Number.parseFloat(supplierVatRate.value) || 0;
+        const vat = Math.round(net * vatRate) / 100;
+        const total = Math.round((net + vat) * 100) / 100;
+        supplierVatAmount.textContent = vat.toFixed(2).replace('.', ',');
+        supplierTotalPrice.textContent = total.toFixed(2).replace('.', ',');
+        suggestedCatalogPrice.textContent = (Math.round(total * 130) / 100).toFixed(2).replace('.', ',');
+      };
+      supplierNet.addEventListener('input', updateSupplierPrices);
+      supplierVatRate.addEventListener('input', updateSupplierPrices);
+      updateSupplierPrices();
+    }
+
     const roles = Array.from(document.querySelectorAll('#user-role-list input[name="role_codes[]"]'));
     const cityGroup = document.getElementById('user-city-assignments');
     const storeGroup = document.getElementById('user-store-assignments');

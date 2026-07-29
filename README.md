@@ -121,6 +121,7 @@ manteniendo MariaDB como autoridad para SKU, precio y existencias.
 - `db/migrations/006_inventory_views_store_manager.sql`: rol gerente de tienda, vistas de inventario por tienda y ciudad, y sincronización de pedidos con la tienda del producto vendido.
 - `db/migrations/007_inventory_receipts.sql`: entradas de inventario auditadas para proveedores y gerentes dentro de su alcance.
 - `db/migrations/008_rbac.sql`: roles y permisos normalizados con relaciones muchos-a-muchos y migración automática de usuarios existentes.
+- `db/migrations/009_supplier_vat_catalog_pricing.sql`: coste neto del proveedor, IVA separado, total con IVA y permisos independientes para fijar precios de venta.
 - `n8n/workflows/01-local-order-intake.json`: entrada y creación del borrador.
 - `n8n/workflows/02-local-payment-approval.json`: aprobación y descuento.
 - `n8n/workflows/03-local-daily-summary.json`: resumen para logística.
@@ -241,6 +242,13 @@ gerente de tienda puede crear, editar, ajustar cantidades y eliminar productos
 de sus tiendas asignadas. El gerente de ciudad tiene esas mismas facultades
 sobre las tiendas de sus ciudades y puede trasladar existencias entre ellas. El
 admin global puede operar sobre todas las tiendas.
+
+El proveedor registra por separado el importe neto, el porcentaje de IVA, el
+importe de IVA y el total con IVA. Al crear el producto, el sistema propone el
+precio normal del catálogo con un incremento del 30 % sobre el total del
+proveedor. Después, solo vendedor, gerente de tienda y admin global pueden
+modificar el precio normal o promocional; el admin también puede corregir los
+valores aportados por el proveedor.
 
 El proveedor puede crear, editar, activar, desactivar y eliminar productos,
 además de ajustar sus cantidades, exclusivamente en sus tiendas asignadas. No
