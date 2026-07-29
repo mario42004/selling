@@ -210,8 +210,8 @@ OPERATOR_ADMIN_PASSWORD=una-contraseña-larga
 ```
 
 El panel queda en `https://DOMINIO_CONFIGURADO/operator/`. Desde allí el admin
-puede crear proveedores, despachadores y gerentes de ciudad, además de crear
-ciudades, zonas, tiendas y asignaciones.
+global puede crear proveedores, despachadores, gerentes de tienda y gerentes de
+ciudad, además de crear ciudades, zonas, tiendas y asignaciones.
 
 Orden recomendado dentro del panel:
 
@@ -224,10 +224,17 @@ Los roles operativos no deben quedar sin tienda asignada. El vendedor, gerente
 de tienda y gerente de ciudad deben tener ciudad y tienda; proveedor y
 despachador trabajan sobre las tiendas asignadas.
 
-En el catálogo, cada producto se crea asociado a una tienda propietaria. La
-ciudad agrupa tiendas: un gerente de ciudad o admin puede trasladar existencias
-entre tiendas de la misma ciudad desde la sección Catálogo. Los roles de tienda
-no pueden hacer traslados entre tiendas.
+En el catálogo, cada producto se crea asociado a una tienda propietaria. El
+gerente de tienda puede crear, editar, ajustar cantidades y eliminar productos
+de sus tiendas asignadas. El gerente de ciudad tiene esas mismas facultades
+sobre las tiendas de sus ciudades y puede trasladar existencias entre ellas. El
+admin global puede operar sobre todas las tiendas.
+
+Los gerentes de tienda y ciudad pueden cancelar pedidos dentro de su alcance,
+pero no eliminarlos del sistema. Al cancelar un pedido confirmado o despachado,
+sus unidades vuelven al inventario. Solamente el admin global puede eliminar un
+pedido definitivamente; el borrado elimina sus artículos y eventos y también
+restaura el stock cuando corresponde.
 
 El inventario se maneja por tienda, producto y talla. Cuando se aprueba una
 venta, MariaDB vuelve a validar el stock y descuenta únicamente la variante de

@@ -34,7 +34,7 @@ const ROLE_LABELS = [
     'DISPATCHER' => 'Despachador',
     'STORE_MANAGER' => 'Gerente de tienda',
     'CITY_MANAGER' => 'Gerente de ciudad',
-    'ADMIN' => 'Admin',
+    'ADMIN' => 'Admin global',
 ];
 
 function requiredEnvironment(string $name): string
@@ -129,6 +129,32 @@ function imageSrc(string $basePath, ?string $url): string
     return $basePath . ltrim($url, '/');
 }
 
+function localUploadPath(?string $url): ?string
+{
+    $url = trim((string) $url);
+    if (!preg_match('#^uploads/([a-f0-9]{24}\.(?:jpg|png|webp))$#', $url, $matches)) {
+        return null;
+    }
+    return __DIR__ . '/uploads/' . $matches[1];
+}
+
+function removeLocalUploads(array $urls): void
+{
+    foreach (array_unique($urls) as $url) {
+        $path = localUploadPath(is_string($url) ? $url : null);
+        if ($path !== null && is_file($path)) {
+            @unlink($path);
+        }
+    }
+}
+
+function requireDestructiveConfirmation(): void
+{
+    if (($_POST['confirm_delete'] ?? '') !== '1') {
+        throw new RuntimeException('Confirma la eliminación definitiva antes de continuar.');
+    }
+}
+
 function normalizeIds(mixed $value): array
 {
     if (!is_array($value)) {
@@ -173,13 +199,15 @@ function can(array $user, string $permission): bool
 {
     $role = (string) $user['role'];
     return match ($permission) {
-        'catalog.write' => in_array($role, ['SELLER', 'PROVIDER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'catalog.write' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'inventory.transfer' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
+        'orders.cancel' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
+        'orders.delete' => $role === 'ADMIN',
         'orders.view' => in_array($role, ['SELLER', 'DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
         'orders.approve' => in_array($role, ['DISPATCHER', 'CITY_MANAGER', 'ADMIN'], true),
         'shipments.view' => in_array($role, ['DISPATCHER', 'STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
         'stats.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
         'inventory.view' => in_array($role, ['STORE_MANAGER', 'CITY_MANAGER', 'ADMIN'], true),
-        'inventory.transfer' => in_array($role, ['CITY_MANAGER', 'ADMIN'], true),
         'users.manage', 'locations.manage' => $role === 'ADMIN',
         default => false,
     };
@@ -321,6 +349,7 @@ function saveProduct(PDO $pdo, array $user): int
     $sizes = $_POST['variant_size'] ?? [];
     $stocks = $_POST['variant_stock'] ?? [];
     $skus = $_POST['variant_sku'] ?? [];
+    $variantIds = $_POST['variant_id'] ?? [];
     $variants = [];
     foreach (is_array($sizes) ? $sizes : [] as $index => $rawSize) {
         $size = trim((string) $rawSize);
@@ -332,7 +361,8 @@ function saveProduct(PDO $pdo, array $user): int
         if ($size === '' || $stock === false) {
             throw new RuntimeException('Cada variante debe tener talla y cantidad válida.');
         }
-        $variants[] = ['size' => $size, 'stock' => (int) $stock, 'sku' => $sku];
+        $variantId = filter_var($variantIds[$index] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $variants[] = ['id' => $variantId === false ? null : (int) $variantId, 'size' => $size, 'stock' => (int) $stock, 'sku' => $sku];
     }
     if ($variants === []) {
         throw new RuntimeException('Crea al menos una talla o variante.');
@@ -355,6 +385,7 @@ function saveProduct(PDO $pdo, array $user): int
 
     $pdo->beginTransaction();
     try {
+        $existingVariantIds = [];
         if ($productId !== false) {
             $statement = $pdo->prepare('SELECT store_id FROM products WHERE id = ? FOR UPDATE');
             $statement->execute([(int) $productId]);
@@ -366,15 +397,31 @@ function saveProduct(PDO $pdo, array $user): int
             $statement = $pdo->prepare('UPDATE products SET store_id = ?, sku = ?, name = ?, description = ?, category = ?, type = ?, brand = ?, color = ?, gender = ?, aliases = ?, unit = ?, price = ?, sale_price = ?, stock = ?, image_url = ?, active = ? WHERE id = ?');
             $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active, (int) $productId]);
             $savedId = (int) $productId;
-            $pdo->prepare('DELETE FROM product_variants WHERE product_id = ?')->execute([$savedId]);
+            $statement = $pdo->prepare('SELECT id FROM product_variants WHERE product_id = ? FOR UPDATE');
+            $statement->execute([$savedId]);
+            $existingVariantIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
         } else {
             $statement = $pdo->prepare('INSERT INTO products (store_id, sku, name, description, category, type, brand, color, gender, aliases, unit, price, sale_price, stock, image_url, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
             $statement->execute([(int) $storeId, $primarySku, $name, $description, $category, $type, $brand ?: null, $color ?: null, $gender ?: null, $aliases, $type, $price, $salePrice ?: null, $totalStock, $imageUrl ?: null, $active]);
             $savedId = (int) $pdo->lastInsertId();
         }
-        $variantStatement = $pdo->prepare('INSERT INTO product_variants (product_id, sku, size, stock, active) VALUES (?, ?, ?, ?, ?)');
+        $variantInsert = $pdo->prepare('INSERT INTO product_variants (product_id, sku, size, stock, active) VALUES (?, ?, ?, ?, ?)');
+        $variantUpdate = $pdo->prepare('UPDATE product_variants SET sku = ?, size = ?, stock = ?, active = ? WHERE id = ? AND product_id = ?');
+        $savedVariantIds = [];
         foreach ($variants as $variant) {
-            $variantStatement->execute([$savedId, $variant['sku'], $variant['size'], $variant['stock'], $active]);
+            if ($variant['id'] !== null && in_array($variant['id'], $existingVariantIds, true)) {
+                $variantUpdate->execute([$variant['sku'], $variant['size'], $variant['stock'], $active, $variant['id'], $savedId]);
+                $savedVariantIds[] = $variant['id'];
+            } else {
+                $variantInsert->execute([$savedId, $variant['sku'], $variant['size'], $variant['stock'], $active]);
+                $savedVariantIds[] = (int) $pdo->lastInsertId();
+            }
+        }
+        $removedVariantIds = array_values(array_diff($existingVariantIds, $savedVariantIds));
+        if ($removedVariantIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($removedVariantIds), '?'));
+            $pdo->prepare("UPDATE product_variants SET stock = 0, active = FALSE WHERE product_id = ? AND id IN ({$placeholders})")
+                ->execute(array_merge([$savedId], $removedVariantIds));
         }
         if ($imageUrl !== '') {
             $pdo->prepare('UPDATE product_images SET is_primary = FALSE WHERE product_id = ?')->execute([$savedId]);
@@ -426,7 +473,7 @@ function deleteProduct(PDO $pdo, array $user): void
 function transferStock(PDO $pdo, array $user): void
 {
     if (!can($user, 'inventory.transfer')) {
-        throw new RuntimeException('Solo admin y gerente de ciudad pueden trasladar existencias.');
+        throw new RuntimeException('Solo el gerente de ciudad y el admin global pueden trasladar existencias entre tiendas.');
     }
     $variantId = filter_var($_POST['from_variant_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
     $toStoreId = filter_var($_POST['to_store_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
@@ -463,8 +510,11 @@ function transferStock(PDO $pdo, array $user): void
         $statement = $pdo->prepare('SELECT city_id FROM stores WHERE id = ?');
         $statement->execute([(int) $toStoreId]);
         $targetCityId = $statement->fetchColumn();
-        if ($targetCityId === false || (int) $targetCityId !== (int) $source['city_id']) {
-            throw new RuntimeException('Solo se pueden trasladar existencias dentro de la misma ciudad.');
+        if ($targetCityId === false) {
+            throw new RuntimeException('Tienda destino no encontrada.');
+        }
+        if ($user['role'] !== 'ADMIN' && (int) $targetCityId !== (int) $source['city_id']) {
+            throw new RuntimeException('El gerente de ciudad solo puede trasladar existencias dentro de la misma ciudad.');
         }
 
         $statement = $pdo->prepare(
@@ -526,6 +576,150 @@ function transferStock(PDO $pdo, array $user): void
         $pdo->prepare('INSERT INTO stock_transfers (from_store_id, to_store_id, from_product_id, from_variant_id, to_product_id, to_variant_id, quantity, actor_user_id, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
             ->execute([(int) $source['store_id'], (int) $toStoreId, (int) $source['product_id'], (int) $variantId, (int) $targetProductId, (int) $targetVariantId, (int) $quantity, (int) $user['id'], $notes ?: null]);
         $pdo->commit();
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+}
+
+function orderItemsForUpdate(PDO $pdo, int $orderId): array
+{
+    $statement = $pdo->prepare(
+        'SELECT product_id, variant_id, sku, size, quantity
+         FROM order_items
+         WHERE order_id = ?
+         ORDER BY id
+         FOR UPDATE'
+    );
+    $statement->execute([$orderId]);
+    return $statement->fetchAll();
+}
+
+function restoreOrderInventory(PDO $pdo, array $items): void
+{
+    $variantProductIds = [];
+    foreach ($items as $item) {
+        $quantity = (int) $item['quantity'];
+        $productId = (int) $item['product_id'];
+        $variantId = $item['variant_id'] === null ? null : (int) $item['variant_id'];
+
+        if ($variantId !== null) {
+            $statement = $pdo->prepare('UPDATE product_variants SET stock = stock + ?, active = TRUE WHERE id = ? AND product_id = ?');
+            $statement->execute([$quantity, $variantId, $productId]);
+            if ($statement->rowCount() !== 1) {
+                $statement = $pdo->prepare(
+                    'SELECT id FROM product_variants
+                     WHERE product_id = ? AND (sku = ? OR size = ?)
+                     ORDER BY (sku = ?) DESC, id
+                     LIMIT 1 FOR UPDATE'
+                );
+                $statement->execute([$productId, (string) $item['sku'], (string) $item['size'], (string) $item['sku']]);
+                $replacementVariantId = $statement->fetchColumn();
+                if ($replacementVariantId === false) {
+                    $restoredSku = 'RESTORED-' . $productId . '-' . bin2hex(random_bytes(6));
+                    $statement = $pdo->prepare('INSERT INTO product_variants (product_id, sku, size, stock, active) VALUES (?, ?, ?, ?, TRUE)');
+                    $statement->execute([$productId, $restoredSku, trim((string) $item['size']) ?: 'Restaurada', $quantity]);
+                } else {
+                    $statement = $pdo->prepare('UPDATE product_variants SET stock = stock + ?, active = TRUE WHERE id = ?');
+                    $statement->execute([$quantity, (int) $replacementVariantId]);
+                }
+            }
+        } else {
+            $statement = $pdo->prepare('UPDATE products SET stock = stock + ? WHERE id = ?');
+            $statement->execute([$quantity, $productId]);
+        }
+        if ($statement->rowCount() !== 1) {
+            throw new RuntimeException("No se pudo devolver al inventario el producto #{$productId}.");
+        }
+        if ($variantId !== null) {
+            $variantProductIds[$productId] = true;
+        }
+    }
+
+    if ($variantProductIds !== []) {
+        $productIds = array_keys($variantProductIds);
+        $placeholders = implode(',', array_fill(0, count($productIds), '?'));
+        $pdo->prepare(
+            "UPDATE products p
+             SET p.stock = (SELECT COALESCE(SUM(pv.stock), 0) FROM product_variants pv WHERE pv.product_id = p.id)
+             WHERE p.id IN ({$placeholders})"
+        )->execute($productIds);
+    }
+}
+
+function cancelOrder(PDO $pdo, array $user): int
+{
+    if (!can($user, 'orders.cancel')) {
+        throw new RuntimeException('No tienes permiso para cancelar pedidos.');
+    }
+    $orderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    if ($orderId === false) {
+        throw new RuntimeException('Pedido no válido.');
+    }
+    assertOrderAccess($pdo, $user, (int) $orderId);
+
+    $pdo->beginTransaction();
+    try {
+        $statement = $pdo->prepare('SELECT status FROM orders WHERE id = ? FOR UPDATE');
+        $statement->execute([(int) $orderId]);
+        $status = $statement->fetchColumn();
+        if (!is_string($status)) {
+            throw new RuntimeException('Pedido no encontrado.');
+        }
+        if ($status === 'CANCELLED') {
+            throw new RuntimeException('El pedido ya está cancelado.');
+        }
+        if (in_array($status, ['CONFIRMED', 'DISPATCHED'], true)) {
+            restoreOrderInventory($pdo, orderItemsForUpdate($pdo, (int) $orderId));
+        }
+        $pdo->prepare("UPDATE orders SET status = 'CANCELLED' WHERE id = ?")->execute([(int) $orderId]);
+        $pdo->prepare('INSERT INTO order_events (order_id, event_type, actor, details) VALUES (?, ?, ?, ?)')
+            ->execute([(int) $orderId, 'ORDER_CANCELLED', (string) $user['email'], json_encode(['stock_restored' => in_array($status, ['CONFIRMED', 'DISPATCHED'], true), 'source' => 'sales-backoffice'], JSON_THROW_ON_ERROR)]);
+        $pdo->commit();
+        return (int) $orderId;
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+}
+
+function deleteOrder(PDO $pdo, array $user): int
+{
+    if (!can($user, 'orders.delete')) {
+        throw new RuntimeException('Solo el admin global puede eliminar pedidos.');
+    }
+    requireDestructiveConfirmation();
+    $orderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    if ($orderId === false) {
+        throw new RuntimeException('Pedido no válido.');
+    }
+
+    $paymentProofUrl = '';
+    $pdo->beginTransaction();
+    try {
+        $statement = $pdo->prepare('SELECT status, payment_proof_url FROM orders WHERE id = ? FOR UPDATE');
+        $statement->execute([(int) $orderId]);
+        $order = $statement->fetch();
+        if (!is_array($order)) {
+            throw new RuntimeException('Pedido no encontrado.');
+        }
+        $paymentProofUrl = (string) ($order['payment_proof_url'] ?? '');
+
+        if (in_array((string) $order['status'], ['CONFIRMED', 'DISPATCHED'], true)) {
+            restoreOrderInventory($pdo, orderItemsForUpdate($pdo, (int) $orderId));
+        }
+
+        $pdo->prepare('UPDATE conversations SET active_order_id = NULL WHERE active_order_id = ?')->execute([(int) $orderId]);
+        $pdo->prepare('DELETE FROM order_events WHERE order_id = ?')->execute([(int) $orderId]);
+        $pdo->prepare('DELETE FROM order_items WHERE order_id = ?')->execute([(int) $orderId]);
+        $pdo->prepare('DELETE FROM orders WHERE id = ?')->execute([(int) $orderId]);
+        $pdo->commit();
+        removeLocalUploads([$paymentProofUrl]);
+        return (int) $orderId;
     } catch (Throwable $error) {
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
@@ -771,6 +965,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user !== null && $pdo instanceof P
             }
             $savedId = saveUser($pdo);
             redirectWithFlash($basePath, "Usuario #{$savedId} guardado.", 'success', 'users');
+        }
+        if ($action === 'cancel_order') {
+            $cancelledId = cancelOrder($pdo, $user);
+            redirectWithFlash($basePath, "Pedido #{$cancelledId} cancelado. Permanece en el historial y, si había descontado stock, las unidades fueron devueltas.", 'success', 'orders', ['status' => $selectedStatus]);
+        }
+        if ($action === 'delete_order') {
+            $deletedId = deleteOrder($pdo, $user);
+            redirectWithFlash($basePath, "Pedido #{$deletedId} eliminado definitivamente. El inventario fue restaurado cuando correspondía.", 'success', 'orders', ['status' => $selectedStatus]);
         }
 
         $orderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
@@ -1101,6 +1303,8 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
     .muted,.item small { color:var(--muted); }
     .actions { padding:0 18px 18px; }
     .actions form { margin:0; }
+    .destructive-confirm { display:flex; align-items:center; gap:7px; padding:6px 9px; border:1px solid #dda7a2; border-radius:8px; color:var(--red); font-size:12px; font-weight:800; }
+    .destructive-confirm input { width:auto; margin:0; }
     button,.button { border:0; border-radius:8px; padding:10px 14px; color:#fff; font-weight:800; cursor:pointer; text-decoration:none; display:inline-block; }
     .approve,.primary { background:var(--green); }
     .reject,.danger { background:var(--red); }
@@ -1180,8 +1384,8 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
             <label class="wide"><input type="checkbox" name="active" value="1" <?= (int) $formProduct['active'] === 1 ? 'checked' : '' ?>> Producto activo</label>
           </div>
           <h3>Tallas y cantidades</h3>
-          <?php for ($i = 0; $i < max(5, count($editVariants)); $i++): $variant = $editVariants[$i] ?? ['sku' => '', 'size' => '', 'stock' => '']; ?>
-            <div class="variant-row"><input name="variant_size[]" value="<?= escape((string) $variant['size']) ?>" placeholder="Talla M"><input name="variant_sku[]" value="<?= escape((string) $variant['sku']) ?>" placeholder="SKU opcional"><input name="variant_stock[]" value="<?= escape((string) $variant['stock']) ?>" inputmode="numeric" placeholder="Cantidad"></div>
+          <?php for ($i = 0; $i < max(5, count($editVariants)); $i++): $variant = $editVariants[$i] ?? ['id' => '', 'sku' => '', 'size' => '', 'stock' => '']; ?>
+            <div class="variant-row"><input type="hidden" name="variant_id[]" value="<?= escape((string) $variant['id']) ?>"><input name="variant_size[]" value="<?= escape((string) $variant['size']) ?>" placeholder="Talla M"><input name="variant_sku[]" value="<?= escape((string) $variant['sku']) ?>" placeholder="SKU opcional"><input name="variant_stock[]" value="<?= escape((string) $variant['stock']) ?>" inputmode="numeric" placeholder="Cantidad"></div>
           <?php endfor; ?>
           <div class="actions"><button class="approve" type="submit">Guardar producto</button><?php if ($editProduct): ?><a class="button neutral" href="<?= escape(viewUrl($basePath, 'catalog')) ?>">Nuevo</a><?php endif; ?></div>
         </form>
@@ -1192,7 +1396,7 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
               <input type="hidden" name="action" value="transfer_stock">
               <input type="hidden" name="view" value="catalog">
               <h2>Trasladar existencias</h2>
-              <p class="muted">Solo admin y gerente de ciudad pueden mover stock entre tiendas de una misma ciudad. Si el producto no existe en destino, se crea automáticamente con la misma ficha.</p>
+              <p class="muted">El gerente de ciudad puede mover stock entre sus tiendas asociadas; el admin global puede hacerlo en todo su alcance. Si el producto no existe en destino, se crea automáticamente con la misma ficha.</p>
               <label><span>Producto origen</span><select name="from_variant_id" required><?php foreach ($transferVariants as $variant): ?><option value="<?= (int) $variant['variant_id'] ?>"><?= escape($variant['city_name'] . ' · ' . $variant['store_name'] . ' · ' . $variant['name'] . ' · talla ' . $variant['size'] . ' · stock ' . $variant['stock']) ?></option><?php endforeach; ?></select></label>
               <label><span>Tienda destino</span><select name="to_store_id" required><?php foreach ($visibleStores as $store): ?><option value="<?= (int) $store['id'] ?>"><?= escape($store['city_name'] . ' · ' . ($store['zone_name'] ?? 'Sin zona') . ' · ' . $store['name']) ?></option><?php endforeach; ?></select></label>
               <label><span>Cantidad</span><input name="quantity" inputmode="numeric" required></label>
@@ -1260,7 +1464,20 @@ $formUser = $editUser ?? ['id' => '', 'name' => '', 'email' => '', 'role' => 'SE
           <article class="order">
             <div class="head"><div class="title"><h2>Pedido #<?= (int) $order['id'] ?> · <?= escape($order['customer_name']) ?></h2><span class="badge <?= escape($order['status']) ?>"><?= escape(statusLabel($order['status'])) ?></span></div><strong>$<?= money($order['total']) ?></strong></div>
             <div class="body"><div class="facts"><div class="fact"><span>Tienda</span><?= escape(($order['city_name'] ?? '') . ' · ' . ($order['zone_name'] ?? '') . ' · ' . ($order['store_name'] ?? '')) ?></div><div class="fact"><span>Teléfono</span><a href="tel:<?= escape($order['phone']) ?>"><?= escape($order['phone']) ?></a></div><div class="fact"><span>Dirección</span><?= escape($order['delivery_address']) ?></div><div class="fact"><span>Pedido original</span><?= nl2br(escape($order['raw_message'])) ?></div><?php if ($order['payment_proof_url']): ?><div class="fact"><span>Comprobante</span><a href="<?= escape(imageSrc($basePath, $order['payment_proof_url'])) ?>" target="_blank" rel="noopener">Ver imagen</a></div><?php endif; ?><?php if ($order['reviewer_name']): ?><div class="fact"><span>Revisado por</span><?= escape($order['reviewer_name']) ?></div><?php endif; ?></div><div class="items"><?php foreach ($order['items'] as $item): ?><div class="item"><?php if ($item['image_url']): ?><img src="<?= escape(imageSrc($basePath, $item['image_url'])) ?>" alt="" loading="lazy"><?php else: ?><span></span><?php endif; ?><div><strong><?= (int) $item['quantity'] ?> x <?= escape($item['product_name']) ?></strong><br><small><?= escape($item['sku']) ?><?= $item['size'] ? ' · talla ' . escape($item['size']) : '' ?> · $<?= money($item['unit_price']) ?></small></div><strong>$<?= money((float) $item['quantity'] * (float) $item['unit_price']) ?></strong></div><?php endforeach; ?></div></div>
-            <div class="actions"><?php if (can($user, 'orders.approve') && $order['status'] === 'PENDING_PAYMENT'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form><?php elseif (can($user, 'orders.approve') && $order['status'] === 'CONFIRMED'): ?><form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form><?php endif; ?></div>
+            <div class="actions">
+              <?php if (can($user, 'orders.approve') && $order['status'] === 'PENDING_PAYMENT'): ?>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="approve"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="approve" type="submit">Confirmar pago</button></form>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="reject"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="reject" type="submit">Rechazar pago</button></form>
+              <?php elseif (can($user, 'orders.approve') && $order['status'] === 'CONFIRMED'): ?>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="dispatch"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="dispatch" type="submit">Marcar despachado</button></form>
+              <?php endif; ?>
+              <?php if (can($user, 'orders.cancel') && in_array($order['status'], ['PENDING_PAYMENT', 'CONFIRMED', 'DISPATCHED'], true)): ?>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="cancel_order"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><button class="neutral" type="submit">Cancelar pedido</button></form>
+              <?php endif; ?>
+              <?php if (can($user, 'orders.delete')): ?>
+                <form method="post"><input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id'] ?>"><input type="hidden" name="action" value="delete_order"><input type="hidden" name="return_status" value="<?= escape($selectedStatus) ?>"><label class="destructive-confirm"><input type="checkbox" name="confirm_delete" value="1" required> Confirmar borrado definitivo</label><button class="danger" type="submit">Eliminar pedido</button></form>
+              <?php endif; ?>
+            </div>
           </article>
         <?php endforeach; ?>
         <?php if ($orders === []): ?><div class="empty">No hay pedidos visibles en este estado.</div><?php endif; ?>
